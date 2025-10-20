@@ -101,20 +101,31 @@ bool should_skip(const char *path, bool is_dir){
     if (strcmp(name, ".hg") == 0) return true;
     if (strcmp(name, ".bzr") == 0) return true;
     if (strcmp(name, ".fslckout") == 0) return true;
-    if (strcmp(name, ".fslckout-shm") == 0) return true;
-    if (strcmp(name, ".fslckout-wal") == 0) return true;
-    const char *globs[] = { "*~", "*~.*", "#*#", ".#*", "*.swp", "*.swo", "*.swx", ".*.swp", ".~lock.*", "*.tmp", "*.temp", "*.part", "*.crdownload", "*.partial", "~$*", ".~*", "._*", "ehthumbs.db" };
+
+    const char *globs[] = {
+        "*~", "*~.*", "#*#", ".#*", "*.swp", "*.swo", "*.swx", ".*.swp",
+        ".~lock.*", "*.tmp", "*.temp", "*.part", "*.crdownload", "*.partial",
+        "~$*", ".~*", "._*", "ehthumbs.db"
+    };
     for (size_t i = 0; i < sizeof(globs)/sizeof(globs[0]); ++i){
         if (fnmatch(globs[i], name, 0) == 0) return true;
     }
+
     if (name[0] == '~') return true;
     if (strstr(name, ".swp") || strstr(name, ".swo")) return true;
+
+    // 新增：忽略所有以 -shm 或 -wal 结尾的文件
+    size_t len = strlen(name);
+    if (len > 4 && strcmp(name + len - 4, "-shm") == 0) return true;
+    if (len > 4 && strcmp(name + len - 4, "-wal") == 0) return true;
+
     if (is_dir){
         if (strcmp(name, "__MACOSX") == 0) return true;
         if (strcmp(name, "node_modules") == 0) return true;
     }
     return false;
 }
+
 int64_t mach_absolute_time_to_us(uint64_t ticks) {
     static mach_timebase_info_data_t timebase = {0,0};
     if (timebase.denom == 0) {
@@ -167,7 +178,6 @@ uint64_t extract_end(const char *str) {
 uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) {
     if (!db || !prefix || !encoded_len) return NULL;
     *encoded_len = 0;
-    const char *last_key = NULL;
     size_t prefix_len = strlen(prefix);
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
     leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
@@ -179,13 +189,12 @@ uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) 
     size_t capacity = 8;
     payload.files = calloc(capacity, sizeof(pb_bytes_array_t *));
     if (!payload.files) goto fail;
+    if(strlen(prefix)>32)leveldb_iter_next(it);
     while (leveldb_iter_valid(it)) {
         size_t key_len = 0;
         const char *key = leveldb_iter_key(it, &key_len);
-        last_key = key;
         if (key_len < prefix_len || strncmp(key, prefix, 11) != 0)
             break;
-
         size_t val_len = 0;
         const char *val = leveldb_iter_value(it, &val_len);
 
@@ -205,13 +214,11 @@ uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) 
         }
 
         payload.files[payload.files_count++] = bytes;
-
+        payload.lastUpdatedTime = extract_middle(key);
+        payload.eventId = extract_end(key);
         leveldb_iter_next(it);
     }
-    if(payload.files_count>0 && last_key){
-        payload.lastUpdatedTime = extract_middle(last_key);
-        payload.eventId = extract_end(last_key);
-    }else{
+    if(payload.files_count==0){
         uint64_t ticks = mach_absolute_time();
         int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
         payload.lastUpdatedTime = timeNow;
@@ -311,9 +318,12 @@ static void process_path(Job *job) {
     }
 
     // 构造 key: "file:1:<hash>"
-    RepoMapEntry *e = repo_map_find(job->root);
+    int repoid = 0;
+    if (!repo_map_get_repoid(job->root, &repoid)) {
+        goto end;
+    }
     char key[128];
-    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu",e->repoid,timeNow,job->eventid);
+    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, timeNow, job->eventid);
 
     if (put_value_to_leveldb(key, (const char *)buffer, message_length) != 0) {
         fprintf(stderr, "Failed to put key %s\n", key);
@@ -561,18 +571,18 @@ static void handle_http_get(int client_fd) {
         int64_t lastsynctime = strtoll(lastsync_str, NULL, 10);
         uint64_t eventid = strtoull(eventid_str, NULL, 10);
         size_t encoded_len = 0;
-        RepoMapEntry *e = repo_map_find(workspace);
-        if(e == NULL){
+        int repoid = 0;
+        if (!repo_map_get_repoid(workspace, &repoid)) {
             http_respond_404(client_fd);
             return;
         }
         char key[1024];
         if(lastsynctime && eventid){
-            snprintf(key, sizeof(key),"1:%08d:%020lld:%020llu",e->repoid,lastsynctime,eventid);
+            snprintf(key, sizeof(key),"1:%08d:%020lld:%020llu", repoid, lastsynctime, eventid);
         }else if(lastsynctime && !eventid){
-            snprintf(key, sizeof(key),"1:%08d:%020lld:",e->repoid,lastsynctime);
+            snprintf(key, sizeof(key),"1:%08d:%020lld:", repoid, lastsynctime);
         }else{
-            snprintf(key, sizeof(key), "1:%08d:",e->repoid);
+            snprintf(key, sizeof(key), "1:%08d:", repoid);
         }
         
         uint8_t *encoded_payload = get_encoded_payload_by_prefix( key, &encoded_len);
@@ -649,6 +659,7 @@ static void handle_http_post(int client_fd) {
         pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)body_buf, received_body);
 
         if (!pb_decode(&stream, RegisterDirectoryRequest_fields, &registerdir)) {
+            pb_release(RegisterDirectoryRequest_fields, &registerdir);
             http_respond_400(client_fd);
             goto cleanup;
         }
@@ -659,8 +670,8 @@ static void handle_http_post(int client_fd) {
             goto cleanup;
         }
 
-        RepoMapEntry *e = repo_map_find(registerdir.path);
-        if (!e) {
+        bool already_registered = repo_map_get_repoid(registerdir.path, NULL);
+        if (!already_registered) {
             FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
             FSEventStreamContext *fs_ctx = calloc(1, sizeof(FSEventStreamContext));
             CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
@@ -678,6 +689,10 @@ static void handle_http_post(int client_fd) {
             ctx->fs_ctx = fs_ctx;
             ctx->work_q = work_q;
             ctx->root = strdup(registerdir.path);
+            if (!ctx->root) {
+                http_respond_500(client_fd, "OOM");
+                goto fs_fail;
+            }
 
             FSEventStreamCreateFlags flags =
                 kFSEventStreamCreateFlagFileEvents |
@@ -688,6 +703,7 @@ static void handle_http_post(int client_fd) {
             ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr,
                                               kFSEventStreamEventIdSinceNow, 0.01, flags);
             CFRelease(arr);
+            arr = NULL;
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
             if (!ctx->stream || !FSEventStreamStart(ctx->stream)) {
                 fprintf(stderr, "FSEvent start failed\n");
@@ -736,14 +752,28 @@ static void handle_http_post(int client_fd) {
             goto cleanup;
 
         fs_fail:
+            if (arr) {
+                CFRelease(arr);
+                arr = NULL;
+            }
             if (ctx) {
                 if (ctx->stream) {
+                    FSEventStreamStop(ctx->stream);
                     FSEventStreamInvalidate(ctx->stream);
                     FSEventStreamRelease(ctx->stream);
                 }
                 free(ctx->root);
-                free(ctx->fs_ctx);
+                if (ctx->fs_ctx) {
+                    free(ctx->fs_ctx);
+                    ctx->fs_ctx = NULL;
+                    fs_ctx = NULL;
+                }
                 free(ctx);
+                ctx = NULL;
+            }
+            if (fs_ctx) {
+                free(fs_ctx);
+                fs_ctx = NULL;
             }
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
             goto cleanup;
@@ -945,6 +975,7 @@ int main(int argc, char *argv[]) {
     }
     
     work_q = dispatch_queue_create(WORKER_QUEUE_LABEL, DISPATCH_QUEUE_SERIAL);
+    repo_map_register_work_queue(work_q);
     // Retrieve the workspace stored in leveldb
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
     leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
