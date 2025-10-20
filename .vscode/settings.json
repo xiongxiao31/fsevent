@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "sysctl.h": "c",
+        "time.h": "c",
+        "c.h": "c",
+        "mach_time.h": "c"
+    }
+}

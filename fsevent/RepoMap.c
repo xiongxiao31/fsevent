@@ -17,8 +17,11 @@ static void free_fsevents_stream(FSEventsStream *stream) {
         FSEventStreamRelease(stream->stream);
         stream->stream = NULL;
     }
-    dispatch_group_wait(stream->group, DISPATCH_TIME_FOREVER);
-    dispatch_release(stream->group);
+    if (stream->group) {
+        dispatch_group_wait(stream->group, DISPATCH_TIME_FOREVER);
+        dispatch_release(stream->group);
+        stream->group = NULL;
+    }
     if (stream->root) {
         free(stream->root);
         stream->root = NULL;
@@ -65,23 +68,30 @@ RepoMapEntry *repo_map_find(const char *workspace) {
 }
 
 // 删除指定 workspace 的 entry
-void repo_map_remove(const char *workspace) {
+bool repo_map_remove(const char *workspace, int *repoid_out) {
     pthread_mutex_lock(&gRepoMapLock);
 
     RepoMapEntry *entry = NULL;
     HASH_FIND_STR(g_repo_map, workspace, entry);
 
+    bool removed = false;
     if (entry) {
         HASH_DEL(g_repo_map, entry);
+
+        if (repoid_out) {
+            *repoid_out = entry->repoid;
+        }
 
         if (entry->stream) {
             free_fsevents_stream(entry->stream);
         }
 
         free(entry);
+        removed = true;
     }
 
     pthread_mutex_unlock(&gRepoMapLock);
+    return removed;
 }
 
 // 清空整个 repo map

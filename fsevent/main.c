@@ -7,7 +7,7 @@
 #include <CoreServices/CoreServices.h>
 #include <sqlite3.h>
 #include <CommonCrypto/CommonDigest.h>
-
+#include <mach/mach_time.h>
 #include <ftw.h>
 #include <dispatch/dispatch.h>
 #include <stdio.h>
@@ -269,6 +269,21 @@ int put_value_to_leveldb(const char *key, const char *value, size_t vlen) {
     leveldb_writeoptions_destroy(woptions);
     if (err) {
         fprintf(stderr, "LevelDB put failed: %s\n", err);
+        leveldb_free(err);
+        return -1;
+    }
+    return 0;
+}
+
+int delete_value_from_leveldb(const char *key) {
+    if (!key) return -1;
+
+    char *err = NULL;
+    leveldb_writeoptions_t *woptions = leveldb_writeoptions_create();
+    leveldb_delete(db, woptions, key, strlen(key), &err);
+    leveldb_writeoptions_destroy(woptions);
+    if (err) {
+        fprintf(stderr, "LevelDB delete failed: %s\n", err);
         leveldb_free(err);
         return -1;
     }
@@ -744,9 +759,41 @@ static void handle_http_post(int client_fd) {
     }
 
     if (strcmp(path, "/close") == 0) {
-        // TODO: close handler
-        
+        RegisterDirectoryRequest request = RegisterDirectoryRequest_init_default;
+        pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)body_buf, received_body);
+        if (!pb_decode(&stream, RegisterDirectoryRequest_fields, &request)) {
+            pb_release(RegisterDirectoryRequest_fields, &request);
+            http_respond_400(client_fd);
+            goto close_cleanup;
+        }
+
+        if (!request.path || request.path[0] == '\0') {
+            pb_release(RegisterDirectoryRequest_fields, &request);
+            http_respond_400(client_fd);
+            goto close_cleanup;
+        }
+
+        int repoid = -1;
+        if (!repo_map_remove(request.path, &repoid)) {
+            pb_release(RegisterDirectoryRequest_fields, &request);
+            http_respond_404(client_fd);
+            goto close_cleanup;
+        }
+
+        if (repoid >= 0) {
+            char key[20];
+            snprintf(key, sizeof(key), "3:%08d", repoid);
+            if (delete_value_from_leveldb(key) != 0) {
+                pb_release(RegisterDirectoryRequest_fields, &request);
+                http_respond_500(client_fd, "Failed to remove workspace");
+                goto close_cleanup;
+            }
+        }
+
+        pb_release(RegisterDirectoryRequest_fields, &request);
         http_respond_200(client_fd, "close ok");
+
+close_cleanup:
         goto cleanup;
     }
 

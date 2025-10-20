@@ -2,6 +2,7 @@
 #include "uthash.h"
 #include <dispatch/dispatch.h>
 #include <CoreServices/CoreServices.h>
+#include <stdbool.h>
 typedef struct {
     dispatch_queue_t work_q;
     FSEventStreamRef stream;
@@ -26,7 +27,7 @@ void repo_map_add(const char *workspace, int repoid, FSEventsStream *stream);
 RepoMapEntry *repo_map_find(const char *workspace);
 
 // 删除 entry
-void repo_map_remove(const char *workspace);
+bool repo_map_remove(const char *workspace, int *repoid_out);
 
 // 清空整个 hash 表
 void repo_map_clear(void);
