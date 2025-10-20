@@ -1,0 +1,3 @@
+# 忽略 Xcode 用户状态文件
+**/xcuserdata/
+
