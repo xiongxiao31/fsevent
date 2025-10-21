@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <arpa/inet.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -49,6 +50,16 @@ typedef struct {
 int64_t startUpTime;
 leveldb_t *db;
 dispatch_queue_t work_q;
+
+typedef struct RestartWatcher {
+    char path[PATH_MAX];
+    dispatch_source_t timer;
+    FSEventStreamEventId resume_from;
+    UT_hash_handle hh;
+} RestartWatcher;
+
+static RestartWatcher *g_restart_watchers = NULL;
+static pthread_mutex_t g_restart_lock = PTHREAD_MUTEX_INITIALIZER;
 /* ---------- utility functions (kept from your original) ---------- */
 
 void print_fsevent_flags(FSEventStreamEventFlags flags) {
@@ -298,15 +309,19 @@ int delete_value_from_leveldb(const char *key) {
 }
 
 /* ---------- Your original process_path but using the write wrapper ---------- */
-static void process_path(Job *job) {
-    const char *path = job->path;
+static void persist_job_event(Job *job) {
+    if (!job || !job->path || !job->root) {
+        goto cleanup;
+    }
+
     FileEventMeta file = FileEventMeta_init_default;
     uint8_t buffer[4096];
     bool status;
     size_t message_length;
     uint64_t ticks = mach_absolute_time();
-    int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
-    file.path = strdup(path);
+    int64_t time_now = mach_absolute_time_to_us(ticks) + startUpTime;
+
+    file.path = strdup(job->path);
     file.flag = job->flag;
 
     pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
@@ -314,37 +329,51 @@ static void process_path(Job *job) {
     message_length = stream.bytes_written;
     if (!status) {
         printf("Encode failed: %s\n", PB_GET_ERROR(&stream));
-        goto end;
+        goto cleanup;
     }
 
-    // 构造 key: "file:1:<hash>"
     int repoid = 0;
     if (!repo_map_get_repoid(job->root, &repoid)) {
-        goto end;
+        fprintf(stderr, "Failed to resolve repo for %s\n", job->root);
+        goto cleanup;
     }
+
+    uint64_t event_id = job->eventid ? job->eventid : (uint64_t)time_now;
     char key[128];
-    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, timeNow, job->eventid);
+    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, time_now, event_id);
 
     if (put_value_to_leveldb(key, (const char *)buffer, message_length) != 0) {
         fprintf(stderr, "Failed to put key %s\n", key);
-        goto end;
+        goto cleanup;
     }
     printf("✅ Saved file meta: %s\n", key);
 
-end:
-    if (path) free((void*)path);
-    if (job->root) free(job->root);
-    if (job) free(job);
+cleanup:
     if (file.path) free(file.path);
 }
 
-/* stub - for directory changes (could enqueue many files) */
-static void process_dir(Job *job) {
-    // TODO: implement directory-level scanning / enqueueing files if desired
+static void process_path(Job *job) {
+    persist_job_event(job);
+
     if (job) {
         if (job->path) free(job->path);
+        if (job->root) free(job->root);
         free(job);
     }
+}
+
+static void process_dir(Job *job) {
+    if (!job) return;
+
+    if (!(job->flag & kFSEventStreamEventFlagItemIsDir)) {
+        job->flag |= kFSEventStreamEventFlagItemIsDir;
+    }
+
+    persist_job_event(job);
+
+    if (job->path) free(job->path);
+    if (job->root) free(job->root);
+    free(job);
 }
 
 /* dispatch wrappers */
@@ -358,60 +387,345 @@ static void dispatch_worker_func_dir(void *vjob) {
 }
 
 
+static FSEventsStream *create_stream_context(const char *path, FSEventStreamEventId since_id) {
+    if (!path) return NULL;
+
+    FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
+    if (!ctx) return NULL;
+
+    ctx->work_q = work_q;
+    ctx->root = strdup(path);
+    if (!ctx->root) {
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->fs_ctx = calloc(1, sizeof(FSEventStreamContext));
+    if (!ctx->fs_ctx) {
+        free(ctx->root);
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->fs_ctx->info = ctx;
+
+    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    if (!arr) {
+        free(ctx->fs_ctx);
+        ctx->fs_ctx = NULL;
+        free(ctx->root);
+        free(ctx);
+        return NULL;
+    }
+
+    CFStringRef s = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
+    if (!s) {
+        CFRelease(arr);
+        free(ctx->fs_ctx);
+        ctx->fs_ctx = NULL;
+        free(ctx->root);
+        free(ctx);
+        return NULL;
+    }
+    CFArrayAppendValue(arr, s);
+    CFRelease(s);
+
+    FSEventStreamCreateFlags flags =
+        kFSEventStreamCreateFlagFileEvents |
+        kFSEventStreamCreateFlagNoDefer |
+        kFSEventStreamCreateFlagIgnoreSelf |
+        kFSEventStreamCreateFlagWatchRoot;
+
+    FSEventStreamEventId since_value = since_id ? since_id : kFSEventStreamEventIdSinceNow;
+    ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, ctx->fs_ctx, arr,
+                                      since_value, 0.01, flags);
+    CFRelease(arr);
+    if (!ctx->stream) {
+        free(ctx->fs_ctx);
+        ctx->fs_ctx = NULL;
+        free(ctx->root);
+        free(ctx);
+        return NULL;
+    }
+
+    FSEventStreamSetDispatchQueue(ctx->stream, work_q);
+    if (!FSEventStreamStart(ctx->stream)) {
+        FSEventStreamStop(ctx->stream);
+        FSEventStreamInvalidate(ctx->stream);
+        FSEventStreamRelease(ctx->stream);
+        ctx->stream = NULL;
+        free(ctx->fs_ctx);
+        ctx->fs_ctx = NULL;
+        free(ctx->root);
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+static void restart_timer_handler(void *ctx);
+static void restart_timer_cancel(void *ctx);
+
+static RestartWatcher *restart_watcher_lookup(const char *path) {
+    RestartWatcher *watcher = NULL;
+    HASH_FIND_STR(g_restart_watchers, path, watcher);
+    return watcher;
+}
+
+static void restart_watcher_cancel_ptr(RestartWatcher *watcher) {
+    if (!watcher) return;
+
+    pthread_mutex_lock(&g_restart_lock);
+    RestartWatcher *found = restart_watcher_lookup(watcher->path);
+    if (found == watcher) {
+        HASH_DEL(g_restart_watchers, watcher);
+        pthread_mutex_unlock(&g_restart_lock);
+        dispatch_source_cancel(watcher->timer);
+        return;
+    }
+    pthread_mutex_unlock(&g_restart_lock);
+}
+
+static void cancel_restart_monitor(const char *path) {
+    if (!path) return;
+
+    pthread_mutex_lock(&g_restart_lock);
+    RestartWatcher *watcher = restart_watcher_lookup(path);
+    if (!watcher) {
+        pthread_mutex_unlock(&g_restart_lock);
+        return;
+    }
+    HASH_DEL(g_restart_watchers, watcher);
+    pthread_mutex_unlock(&g_restart_lock);
+    dispatch_source_cancel(watcher->timer);
+}
+
+static bool restart_stream_for_path(const char *path, FSEventStreamEventId since_id) {
+    if (!path) return false;
+
+    if (access(path, F_OK) != 0) {
+        return false;
+    }
+
+    int repoid = 0;
+    if (!repo_map_get_repoid(path, &repoid)) {
+        return false;
+    }
+
+    FSEventsStream *ctx = create_stream_context(path, since_id);
+    if (!ctx) {
+        return false;
+    }
+
+    repo_map_set_stream(path, ctx);
+    printf("🔁 Restarted watcher for %s\n", path);
+    return true;
+}
+
+static bool restart_watcher_register(const char *path, FSEventStreamEventId event_id) {
+    if (!path || !path[0]) return false;
+
+    pthread_mutex_lock(&g_restart_lock);
+    RestartWatcher *existing = restart_watcher_lookup(path);
+    if (existing) {
+        if (event_id > existing->resume_from) {
+            existing->resume_from = event_id;
+        }
+        pthread_mutex_unlock(&g_restart_lock);
+        return true;
+    }
+
+    RestartWatcher *watcher = calloc(1, sizeof(RestartWatcher));
+    if (!watcher) {
+        pthread_mutex_unlock(&g_restart_lock);
+        return false;
+    }
+
+    strncpy(watcher->path, path, sizeof(watcher->path) - 1);
+    watcher->resume_from = event_id;
+
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    watcher->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    if (!watcher->timer) {
+        free(watcher);
+        pthread_mutex_unlock(&g_restart_lock);
+        return false;
+    }
+
+    dispatch_set_context(watcher->timer, watcher);
+    dispatch_source_set_event_handler_f(watcher->timer, restart_timer_handler);
+    dispatch_source_set_cancel_handler_f(watcher->timer, restart_timer_cancel);
+    dispatch_source_set_timer(watcher->timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                              (uint64_t)(5 * NSEC_PER_SEC),
+                              (uint64_t)(NSEC_PER_SEC / 4));
+
+    HASH_ADD_STR(g_restart_watchers, path, watcher);
+    pthread_mutex_unlock(&g_restart_lock);
+
+    dispatch_resume(watcher->timer);
+    printf("⏳ Waiting for %s to reappear before restarting stream\n", watcher->path);
+    return true;
+}
+
+static void restart_timer_handler(void *ctx) {
+    RestartWatcher *watcher = (RestartWatcher *)ctx;
+    if (!watcher) return;
+
+    if (!repo_map_get_repoid(watcher->path, NULL)) {
+        restart_watcher_cancel_ptr(watcher);
+        return;
+    }
+
+    if (!restart_stream_for_path(watcher->path, watcher->resume_from)) {
+        return;
+    }
+
+    restart_watcher_cancel_ptr(watcher);
+}
+
+static void restart_timer_cancel(void *ctx) {
+    RestartWatcher *watcher = (RestartWatcher *)ctx;
+    if (!watcher) return;
+
+#if !OS_OBJECT_USE_OBJC
+    if (watcher->timer) {
+        dispatch_release(watcher->timer);
+    }
+#endif
+    free(watcher);
+}
+
+
+typedef struct {
+    char *path;
+    FSEventStreamEventId resume_from;
+} RootRemovalTask;
+
+static void deactivate_root_stream(void *ctx) {
+    RootRemovalTask *task = (RootRemovalTask *)ctx;
+    if (!task) return;
+
+    if (task->path) {
+        repo_map_set_stream(task->path, NULL);
+
+        if (repo_map_get_repoid(task->path, NULL)) {
+            if (!restart_stream_for_path(task->path, task->resume_from)) {
+                restart_watcher_register(task->path, task->resume_from);
+            }
+        }
+
+        free(task->path);
+    }
+
+    free(task);
+}
+
+
 static void schedule_full_rescan(FSEventsStream *c) {
     // reocde root path to leveldb send back to the client
     // inform client to do a full rescan
-    
+
 }
 
 /* FSEvents callback (uses dispatch to enqueue jobs) */
 static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallBackInfo, size_t numEvents, void *eventPaths, const FSEventStreamEventFlags eventFlags[], const FSEventStreamEventId eventIds[]) {
     FSEventsStream *c = (FSEventsStream*)clientCallBackInfo;
-    char * root = strdup(c->root);
+    const char *root = c ? c->root : NULL;
     char **paths = eventPaths;
+    bool root_needs_restart = false;
+    FSEventStreamEventId resume_from = 0;
+
     for (size_t i = 0; i < numEvents; i++) {
         const char *p = paths[i];
         FSEventStreamEventFlags flags = eventFlags[i];
+        FSEventStreamEventId event_id = eventIds[i];
 
-        if(flags &(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)){
-            if(should_skip(p, false)) continue;
-        } else if(flags & kFSEventStreamEventFlagItemIsDir){
-            if(should_skip(p, true)) continue;
+        if (flags & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)) {
+            if (should_skip(p, false)) continue;
+        } else if (flags & kFSEventStreamEventFlagItemIsDir) {
+            if (should_skip(p, true)) continue;
         }
 
         printf("path: %s %d\n", p, (int)flags);
         print_fsevent_flags(flags);
 
-        if(flags == (kFSEventStreamEventFlagItemXattrMod | kFSEventStreamEventFlagItemIsFile)){
+        if (flags == (kFSEventStreamEventFlagItemXattrMod | kFSEventStreamEventFlagItemIsFile)) {
             continue;
         }
 
-        if (flags & kFSEventStreamEventFlagKernelDropped || flags & kFSEventStreamEventFlagUserDropped) {
+        if (flags & (kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagUserDropped)) {
             fprintf(stderr, "FSEvents reported dropped events (kernel/user). Scheduling full rescan.\n");
             schedule_full_rescan(c);
+            root_needs_restart = true;
+            if (event_id > resume_from) {
+                resume_from = event_id;
+            }
             continue;
         }
 
-        if(flags &(kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemModified)){
-            if (flags & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)) {
-                Job *job = malloc(sizeof(Job));
-                job->path = strdup(p);
-                job->flag = flags;
-                job->eventid = eventIds[i];
-                job->root = strdup(root);
-                dispatch_async_f(work_q, job, dispatch_worker_func);
-            } else if (flags & kFSEventStreamEventFlagItemIsDir) {
-                Job *job = malloc(sizeof(Job));
-                job->path = strdup(p);
-                job->flag = flags;
-                printf("Dir changed: %s (flag 0x%x)\n", p, (int)flags);
-                dispatch_async_f(work_q, job, dispatch_worker_func_dir);
+        if ((flags & kFSEventStreamEventFlagRootChanged) ||
+            ((flags & kFSEventStreamEventFlagItemRemoved) && root && strcmp(p, root) == 0)) {
+            root_needs_restart = true;
+            if (event_id > resume_from) {
+                resume_from = event_id;
+            }
+        }
+
+        bool is_dir_event = (flags & kFSEventStreamEventFlagItemIsDir) || (root && strcmp(p, root) == 0);
+        bool should_record =
+            (flags & (kFSEventStreamEventFlagItemRemoved |
+                      kFSEventStreamEventFlagItemCreated |
+                      kFSEventStreamEventFlagItemRenamed |
+                      kFSEventStreamEventFlagItemModified))) ||
+            (flags & (kFSEventStreamEventFlagRootChanged |
+                      kFSEventStreamEventFlagMount |
+                      kFSEventStreamEventFlagUnmount));
+
+        if (!should_record) {
+            continue;
+        }
+
+        Job *job = malloc(sizeof(Job));
+        if (!job) {
+            continue;
+        }
+
+        job->path = strdup(p);
+        job->flag = flags;
+        job->eventid = event_id;
+        job->root = root ? strdup(root) : NULL;
+
+        if (!job->path || !job->root) {
+            if (job->path) free(job->path);
+            if (job->root) free(job->root);
+            free(job);
+            continue;
+        }
+
+        if (is_dir_event) {
+            job->flag |= kFSEventStreamEventFlagItemIsDir;
+            printf("Dir changed: %s (flag 0x%x)\n", p, (int)flags);
+            dispatch_async_f(work_q, job, dispatch_worker_func_dir);
+        } else {
+            dispatch_async_f(work_q, job, dispatch_worker_func);
+        }
+    }
+
+    if (root_needs_restart && root && root[0]) {
+        RootRemovalTask *task = calloc(1, sizeof(RootRemovalTask));
+        if (task) {
+            task->path = strdup(root);
+            task->resume_from = resume_from;
+            if (!task->path) {
+                free(task);
+            } else {
+                dispatch_async_f(work_q, task, deactivate_root_stream);
             }
         }
     }
-    free(root);
 }
-
 /* ---------- Simple HTTP server (multithreaded) ---------- */
 
 /* Helper: send all bytes on socket */
@@ -670,48 +984,20 @@ static void handle_http_post(int client_fd) {
             goto cleanup;
         }
 
+        cancel_restart_monitor(registerdir.path);
+
         bool already_registered = repo_map_get_repoid(registerdir.path, NULL);
+        FSEventsStream *ctx = NULL;
         if (!already_registered) {
-            FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
-            FSEventStreamContext *fs_ctx = calloc(1, sizeof(FSEventStreamContext));
-            CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-
-            if (!ctx || !fs_ctx || !arr) {
-                http_respond_500(client_fd, "Alloc failed");
-                goto fs_fail;
-            }
-
-            CFStringRef s = CFStringCreateWithCString(NULL, registerdir.path, kCFStringEncodingUTF8);
-            CFArrayAppendValue(arr, s);
-            CFRelease(s);
-
-            fs_ctx->info = ctx;
-            ctx->fs_ctx = fs_ctx;
-            ctx->work_q = work_q;
-            ctx->root = strdup(registerdir.path);
-            if (!ctx->root) {
-                http_respond_500(client_fd, "OOM");
-                goto fs_fail;
-            }
-
-            FSEventStreamCreateFlags flags =
-                kFSEventStreamCreateFlagFileEvents |
-                kFSEventStreamCreateFlagNoDefer |
-                kFSEventStreamCreateFlagIgnoreSelf |
-                kFSEventStreamCreateFlagWatchRoot;
-
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr,
-                                              kFSEventStreamEventIdSinceNow, 0.01, flags);
-            CFRelease(arr);
-            arr = NULL;
-            FSEventStreamSetDispatchQueue(ctx->stream, work_q);
-            if (!ctx->stream || !FSEventStreamStart(ctx->stream)) {
-                fprintf(stderr, "FSEvent start failed\n");
+            ctx = create_stream_context(registerdir.path, 0);
+            if (!ctx) {
+                pb_release(RegisterDirectoryRequest_fields, &registerdir);
                 http_respond_500(client_fd, "Stream create failed");
-                goto fs_fail;
+                goto cleanup;
             }
+        }
 
-            // 找最大 repoID
+        if (!already_registered) {
             int max_id = 0;
             int exist_id = 0;
             leveldb_readoptions_t *ro = leveldb_readoptions_create();
@@ -750,33 +1036,6 @@ static void handle_http_post(int client_fd) {
             snprintf(resp, sizeof(resp), "%lld", timeNow);
             http_respond_200(client_fd, resp);
             goto cleanup;
-
-        fs_fail:
-            if (arr) {
-                CFRelease(arr);
-                arr = NULL;
-            }
-            if (ctx) {
-                if (ctx->stream) {
-                    FSEventStreamStop(ctx->stream);
-                    FSEventStreamInvalidate(ctx->stream);
-                    FSEventStreamRelease(ctx->stream);
-                }
-                free(ctx->root);
-                if (ctx->fs_ctx) {
-                    free(ctx->fs_ctx);
-                    ctx->fs_ctx = NULL;
-                    fs_ctx = NULL;
-                }
-                free(ctx);
-                ctx = NULL;
-            }
-            if (fs_ctx) {
-                free(fs_ctx);
-                fs_ctx = NULL;
-            }
-            pb_release(RegisterDirectoryRequest_fields, &registerdir);
-            goto cleanup;
         }
 
         pb_release(RegisterDirectoryRequest_fields, &registerdir);
@@ -787,7 +1046,6 @@ static void handle_http_post(int client_fd) {
         http_respond_200(client_fd, resp);
         goto cleanup;
     }
-
     if (strcmp(path, "/close") == 0) {
         RegisterDirectoryRequest request = RegisterDirectoryRequest_init_default;
         pb_istream_t stream = pb_istream_from_buffer((const pb_byte_t *)body_buf, received_body);
@@ -802,6 +1060,8 @@ static void handle_http_post(int client_fd) {
             http_respond_400(client_fd);
             goto close_cleanup;
         }
+
+        cancel_restart_monitor(request.path);
 
         int repoid = -1;
         if (!repo_map_remove(request.path, &repoid)) {
