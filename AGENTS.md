@@ -19,3 +19,53 @@ History mixes Conventional Commit prefixes (`fix: …`) and scoped messages (`in
 
 ## Environment & Dependencies
 Requires macOS with Xcode command-line tools, LevelDB, SQLite3, and CoreServices/CoreFoundation frameworks. Before first build run `xcode-select --install` if toolchains are missing, and ensure `leveldb/c.h` is discoverable via `CPATH`/`LIBRARY_PATH`. Keep local databases and HTTP ports configurable via flags or macros; avoid committing generated DB files except for sanctioned fixtures.
+# Repository Guidelines
+
+## Database Schema & Key Semantics
+All persistent state is maintained in LevelDB. Keys follow a prefixed composite convention:
+<num>:<repoid>:<time>:<eventid>
+
+- num=1 → File event metadata.
+  Value is a nanopb-encoded FileEventMeta:
+    typedef struct _FileEventMeta {
+        char *path;   /* Absolute file path */
+        int64_t flag; /* Incremental flag used by daemon processes */
+    } FileEventMeta;
+  Represents a single file’s event snapshot at <time> within repository <repoid>.
+
+- num=2 → Last recorded timestamp before previous shutdown.
+  Value is a string convertible to int64_t.
+  Used to guard against user-initiated system time changes that could corrupt temporal ordering.
+
+- num=3:<repoid> → Registered repositories before last shutdown.
+  Value stores a UTF-8 path string (repository root).
+  Each successful registration appends an entry under this namespace.
+
+## Protocol Buffer Interfaces
+All network-facing payloads are nanopb-encoded and decoded via pb.h and generated descriptors.
+
+- Client request (RegisterDirectoryRequest):
+    typedef struct _RegisterDirectoryRequest {
+        char *path;
+    } RegisterDirectoryRequest;
+  Sent when registering a new directory to be monitored.
+
+- Server response (FileEventBatch):
+    typedef struct _FileEventBatch {
+        pb_size_t files_count;          /* number of serialized file entries */
+        pb_bytes_array_t **files;       /* array of encoded FileEventMeta */
+        int64_t lastUpdatedTime;        /* latest event timestamp in this batch */
+        uint64_t eventId;               /* unique identifier for batch */
+    } FileEventBatch;
+  Used to deliver accumulated file changes with an event watermark for resumption logic.
+
+## Encoding / Decoding Conventions
+- Use nanopb for both request/response and internal LevelDB values.
+- Always invoke pb_encode() / pb_decode() against the respective generated *_fields descriptors.
+- Store binary value directly; do not Base64-encode for LevelDB.
+- Ensure path is absolute and UTF-8 normalized before encoding.
+
+## Repository Lifecycle & Safety
+- On registration, insert a key 3:<repoid> with value=path.
+- On shutdown, persist the latest time under key 2. 
+- Please be sure to avoid memory leakage.
