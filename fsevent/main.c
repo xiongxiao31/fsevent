@@ -298,15 +298,19 @@ int delete_value_from_leveldb(const char *key) {
 }
 
 /* ---------- Your original process_path but using the write wrapper ---------- */
-static void process_path(Job *job) {
-    const char *path = job->path;
+static void persist_job_event(Job *job) {
+    if (!job || !job->path || !job->root) {
+        goto cleanup;
+    }
+
     FileEventMeta file = FileEventMeta_init_default;
     uint8_t buffer[4096];
     bool status;
     size_t message_length;
     uint64_t ticks = mach_absolute_time();
-    int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
-    file.path = strdup(path);
+    int64_t time_now = mach_absolute_time_to_us(ticks) + startUpTime;
+
+    file.path = strdup(job->path);
     file.flag = job->flag;
 
     pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
@@ -314,37 +318,51 @@ static void process_path(Job *job) {
     message_length = stream.bytes_written;
     if (!status) {
         printf("Encode failed: %s\n", PB_GET_ERROR(&stream));
-        goto end;
+        goto cleanup;
     }
 
-    // 构造 key: "file:1:<hash>"
     int repoid = 0;
     if (!repo_map_get_repoid(job->root, &repoid)) {
-        goto end;
+        fprintf(stderr, "Failed to resolve repo for %s\n", job->root);
+        goto cleanup;
     }
+
+    uint64_t event_id = job->eventid ? job->eventid : (uint64_t)time_now;
     char key[128];
-    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, timeNow, job->eventid);
+    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, time_now, event_id);
 
     if (put_value_to_leveldb(key, (const char *)buffer, message_length) != 0) {
         fprintf(stderr, "Failed to put key %s\n", key);
-        goto end;
+        goto cleanup;
     }
     printf("✅ Saved file meta: %s\n", key);
 
-end:
-    if (path) free((void*)path);
-    if (job->root) free(job->root);
-    if (job) free(job);
+cleanup:
     if (file.path) free(file.path);
 }
 
-/* stub - for directory changes (could enqueue many files) */
-static void process_dir(Job *job) {
-    // TODO: implement directory-level scanning / enqueueing files if desired
+static void process_path(Job *job) {
+    persist_job_event(job);
+
     if (job) {
         if (job->path) free(job->path);
+        if (job->root) free(job->root);
         free(job);
     }
+}
+
+static void process_dir(Job *job) {
+    if (!job) return;
+
+    if (!(job->flag & kFSEventStreamEventFlagItemIsDir)) {
+        job->flag |= kFSEventStreamEventFlagItemIsDir;
+    }
+
+    persist_job_event(job);
+
+    if (job->path) free(job->path);
+    if (job->root) free(job->root);
+    free(job);
 }
 
 /* dispatch wrappers */
@@ -404,6 +422,8 @@ static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallB
                 Job *job = malloc(sizeof(Job));
                 job->path = strdup(p);
                 job->flag = flags;
+                job->eventid = eventIds[i];
+                job->root = strdup(root);
                 printf("Dir changed: %s (flag 0x%x)\n", p, (int)flags);
                 dispatch_async_f(work_q, job, dispatch_worker_func_dir);
             }
