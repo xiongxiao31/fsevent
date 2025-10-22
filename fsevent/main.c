@@ -341,6 +341,71 @@ cleanup:
     if (file.path) free(file.path);
 }
 
+static void remove_repo_entries_from_leveldb(int repoid) {
+    if (repoid < 0) return;
+
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "1:%08d:", repoid);
+    size_t prefix_len = strlen(prefix);
+
+    leveldb_readoptions_t *ro = leveldb_readoptions_create();
+    leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
+    leveldb_iter_seek(it, prefix, prefix_len);
+
+    char **keys = NULL;
+    size_t key_count = 0;
+    size_t key_cap = 0;
+
+    while (leveldb_iter_valid(it)) {
+        size_t key_len = 0;
+        const char *key = leveldb_iter_key(it, &key_len);
+        if (key_len < prefix_len || strncmp(key, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        char *copy = malloc(key_len + 1);
+        if (!copy) {
+            fprintf(stderr, "OOM while collecting keys for repo %d\n", repoid);
+            break;
+        }
+
+        memcpy(copy, key, key_len);
+        copy[key_len] = '\0';
+
+        if (key_count == key_cap) {
+            size_t new_cap = key_cap ? key_cap * 2 : 8;
+            char **new_keys = realloc(keys, new_cap * sizeof(char *));
+            if (!new_keys) {
+                fprintf(stderr, "OOM expanding key list for repo %d\n", repoid);
+                free(copy);
+                break;
+            }
+            keys = new_keys;
+            key_cap = new_cap;
+        }
+
+        keys[key_count++] = copy;
+        leveldb_iter_next(it);
+    }
+
+    leveldb_iter_destroy(it);
+    leveldb_readoptions_destroy(ro);
+
+    for (size_t i = 0; i < key_count; ++i) {
+        if (delete_value_from_leveldb(keys[i]) != 0) {
+            fprintf(stderr, "Failed to delete key %s for repo %d\n", keys[i], repoid);
+        }
+        free(keys[i]);
+    }
+    free(keys);
+
+    char repo_key[20];
+    snprintf(repo_key, sizeof(repo_key), "3:%08d", repoid);
+    if (delete_value_from_leveldb(repo_key) != 0) {
+        fprintf(stderr, "Failed to delete repo key %s\n", repo_key);
+    }
+}
+
 static void process_path(Job *job) {
     persist_job_event(job);
 
@@ -387,9 +452,16 @@ static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallB
     FSEventsStream *c = (FSEventsStream*)clientCallBackInfo;
     char * root = strdup(c->root);
     char **paths = eventPaths;
+    bool root_changed = false;
     for (size_t i = 0; i < numEvents; i++) {
         const char *p = paths[i];
         FSEventStreamEventFlags flags = eventFlags[i];
+
+        if (flags & kFSEventStreamEventFlagRootChanged) {
+            root_changed = true;
+            fprintf(stderr, "Root changed detected for %s, cleaning up.\n", root);
+            continue;
+        }
 
         if(flags &(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)){
             if(should_skip(p, false)) continue;
@@ -429,6 +501,16 @@ static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallB
             }
         }
     }
+
+    if (root_changed) {
+        int repoid = -1;
+        if (repo_map_remove(root, &repoid)) {
+            remove_repo_entries_from_leveldb(repoid);
+        } else {
+            fprintf(stderr, "Failed to remove repo map entry for %s after root change.\n", root);
+        }
+    }
+
     free(root);
 }
 
