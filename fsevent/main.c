@@ -46,6 +46,18 @@ typedef struct {
     int64_t flag;
     uint64 eventid;
 } Job;
+
+typedef struct {
+    int client_fd;
+    char path[1024];
+} HttpGetTask;
+
+typedef struct {
+    int client_fd;
+    char path[256];
+    char *body;
+    size_t body_len;
+} HttpPostTask;
 int64_t startUpTime;
 leveldb_t *db;
 dispatch_queue_t work_q;
@@ -639,26 +651,13 @@ static void parse_http_method(const char *req, char *method, size_t size) {
     strncpy(method, req, len);
     method[len] = '\0';
 }
-/* handle GET /get?repo=<repo>
- * - 示例：返回 raw value bytes as application/octet-stream
- */
-static void handle_http_get(int client_fd) {
-    char buf[8192];
-    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return;
-    buf[n] = '\0';
+static void handle_http_get_on_queue(void *arg) {
+    HttpGetTask *task = (HttpGetTask *)arg;
+    const char *path = task->path;
+    int client_fd = task->client_fd;
 
-    char path[1024];
-    if (simple_parse_request(buf, path, sizeof(path)) != 0) {
-        http_respond_400(client_fd);
-        return;
-    }
-
-
-    // Route 2: /getprefix?key=<prefix> —— 遍历并返回 Payload
     const char *prefix_scan = "/get?";
-    
-    // ✅ Route 2: 使用 nanopb 打包 prefix 匹配的所有 FileMeta
+
     if (strncmp(path, prefix_scan, strlen(prefix_scan)) == 0) {
         const char *query = path + strlen(prefix_scan);
         char workspace[512];
@@ -679,15 +678,15 @@ static void handle_http_get(int client_fd) {
             return;
         }
         char key[1024];
-        if(lastsynctime && eventid){
-            snprintf(key, sizeof(key),"1:%08d:%020lld:%020llu", repoid, lastsynctime, eventid);
-        }else if(lastsynctime && !eventid){
-            snprintf(key, sizeof(key),"1:%08d:%020lld:", repoid, lastsynctime);
-        }else{
+        if (lastsynctime && eventid) {
+            snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, lastsynctime, eventid);
+        } else if (lastsynctime && !eventid) {
+            snprintf(key, sizeof(key), "1:%08d:%020lld:", repoid, lastsynctime);
+        } else {
             snprintf(key, sizeof(key), "1:%08d:", repoid);
         }
-        
-        uint8_t *encoded_payload = get_encoded_payload_by_prefix( key, &encoded_len);
+
+        uint8_t *encoded_payload = get_encoded_payload_by_prefix(key, &encoded_len);
         if (!encoded_payload) {
             http_respond_404(client_fd);
             return;
@@ -706,55 +705,37 @@ static void handle_http_get(int client_fd) {
         return;
     }
 
-    // 未匹配到路径
     http_respond_404(client_fd);
 }
-/* handle post /regist
-   handle post /close
-*/
-static void handle_http_post(int client_fd) {
-    char header_buf[8192];
-    ssize_t n = recv(client_fd, header_buf, sizeof(header_buf) - 1, 0);
+
+/* handle GET /get?repo=<repo>
+ * - 示例：返回 raw value bytes as application/octet-stream
+ */
+static void handle_http_get(int client_fd) {
+    char buf[8192];
+    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
     if (n <= 0) return;
-    header_buf[n] = '\0';
+    buf[n] = '\0';
 
-    const char *body = strstr(header_buf, "\r\n\r\n");
-    if (!body) {
-        http_respond_400(client_fd);
-        return;
-    }
-    body += 4;
-
-    const char *cl_hdr = strcasestr(header_buf, "Content-Length:");
-    size_t content_len = cl_hdr ? strtoul(cl_hdr + 15, NULL, 10) : 0;
-    if (content_len > 16384) {  // 防止过大 body
+    char path[1024];
+    if (simple_parse_request(buf, path, sizeof(path)) != 0) {
         http_respond_400(client_fd);
         return;
     }
 
-    size_t header_len = body - header_buf;
-    size_t received_body = n - header_len;
+    HttpGetTask task;
+    task.client_fd = client_fd;
+    strncpy(task.path, path, sizeof(task.path));
+    task.path[sizeof(task.path) - 1] = '\0';
 
-    // 分配 body 缓冲区
-    char *body_buf = malloc(content_len + 1);
-    if (!body_buf) {
-        http_respond_500(client_fd, "OOM");
-        return;
-    }
-    memcpy(body_buf, body, received_body);
-
-    while (received_body < content_len) {
-        ssize_t m = recv(client_fd, body_buf + received_body, content_len - received_body, 0);
-        if (m <= 0) break;
-        received_body += m;
-    }
-    body_buf[received_body] = '\0';
-
-    char path[256];
-    if (simple_parse_request(header_buf, path, sizeof(path)) != 0) {
-        http_respond_400(client_fd);
-        goto cleanup;
-    }
+    dispatch_sync_f(work_q, &task, handle_http_get_on_queue);
+}
+static void handle_http_post_on_queue(void *arg) {
+    HttpPostTask *task = (HttpPostTask *)arg;
+    int client_fd = task->client_fd;
+    const char *path = task->path;
+    char *body_buf = task->body;
+    size_t received_body = task->body_len;
 
     if (strcmp(path, "/regist") == 0) {
         RegisterDirectoryRequest registerdir = RegisterDirectoryRequest_init_default;
@@ -763,24 +744,28 @@ static void handle_http_post(int client_fd) {
         if (!pb_decode(&stream, RegisterDirectoryRequest_fields, &registerdir)) {
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
             http_respond_400(client_fd);
-            goto cleanup;
+            return;
         }
 
         if (access(registerdir.path, F_OK) != 0) {
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
             http_respond_400(client_fd);
-            goto cleanup;
+            return;
         }
 
         bool already_registered = repo_map_get_repoid(registerdir.path, NULL);
+        FSEventsStream *ctx = NULL;
+        FSEventStreamContext *fs_ctx = NULL;
+        CFMutableArrayRef arr = NULL;
+
         if (!already_registered) {
-            FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
-            FSEventStreamContext *fs_ctx = calloc(1, sizeof(FSEventStreamContext));
-            CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+            ctx = calloc(1, sizeof(FSEventsStream));
+            fs_ctx = calloc(1, sizeof(FSEventStreamContext));
+            arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
 
             if (!ctx || !fs_ctx || !arr) {
                 http_respond_500(client_fd, "Alloc failed");
-                goto fs_fail;
+                goto regist_fail;
             }
 
             CFStringRef s = CFStringCreateWithCString(NULL, registerdir.path, kCFStringEncodingUTF8);
@@ -793,7 +778,7 @@ static void handle_http_post(int client_fd) {
             ctx->root = strdup(registerdir.path);
             if (!ctx->root) {
                 http_respond_500(client_fd, "OOM");
-                goto fs_fail;
+                goto regist_fail;
             }
 
             FSEventStreamCreateFlags flags =
@@ -810,10 +795,9 @@ static void handle_http_post(int client_fd) {
             if (!ctx->stream || !FSEventStreamStart(ctx->stream)) {
                 fprintf(stderr, "FSEvent start failed\n");
                 http_respond_500(client_fd, "Stream create failed");
-                goto fs_fail;
+                goto regist_fail;
             }
 
-            // 找最大 repoID
             int max_id = 0;
             int exist_id = 0;
             leveldb_readoptions_t *ro = leveldb_readoptions_create();
@@ -828,7 +812,7 @@ static void handle_http_post(int client_fd) {
                 if (id > max_id) max_id = id;
 
                 char workspace[512];
-                memcpy(workspace, val, vlen < sizeof(workspace)-1 ? vlen : sizeof(workspace)-1);
+                memcpy(workspace, val, vlen < sizeof(workspace) - 1 ? vlen : sizeof(workspace) - 1);
                 workspace[vlen] = '\0';
                 if (strcmp(registerdir.path, workspace) == 0) exist_id = id;
 
@@ -851,9 +835,9 @@ static void handle_http_post(int client_fd) {
             char resp[32];
             snprintf(resp, sizeof(resp), "%lld", timeNow);
             http_respond_200(client_fd, resp);
-            goto cleanup;
+            return;
 
-        fs_fail:
+regist_fail:
             if (arr) {
                 CFRelease(arr);
                 arr = NULL;
@@ -878,7 +862,7 @@ static void handle_http_post(int client_fd) {
                 fs_ctx = NULL;
             }
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
-            goto cleanup;
+            return;
         }
 
         pb_release(RegisterDirectoryRequest_fields, &registerdir);
@@ -887,7 +871,7 @@ static void handle_http_post(int client_fd) {
         char resp[32];
         snprintf(resp, sizeof(resp), "%lld", timeNow);
         http_respond_200(client_fd, resp);
-        goto cleanup;
+        return;
     }
 
     if (strcmp(path, "/close") == 0) {
@@ -896,20 +880,20 @@ static void handle_http_post(int client_fd) {
         if (!pb_decode(&stream, RegisterDirectoryRequest_fields, &request)) {
             pb_release(RegisterDirectoryRequest_fields, &request);
             http_respond_400(client_fd);
-            goto close_cleanup;
+            return;
         }
 
         if (!request.path || request.path[0] == '\0') {
             pb_release(RegisterDirectoryRequest_fields, &request);
             http_respond_400(client_fd);
-            goto close_cleanup;
+            return;
         }
 
         int repoid = -1;
         if (!repo_map_remove(request.path, &repoid)) {
             pb_release(RegisterDirectoryRequest_fields, &request);
             http_respond_404(client_fd);
-            goto close_cleanup;
+            return;
         }
 
         if (repoid >= 0) {
@@ -918,20 +902,74 @@ static void handle_http_post(int client_fd) {
             if (delete_value_from_leveldb(key) != 0) {
                 pb_release(RegisterDirectoryRequest_fields, &request);
                 http_respond_500(client_fd, "Failed to remove workspace");
-                goto close_cleanup;
+                return;
             }
         }
 
         pb_release(RegisterDirectoryRequest_fields, &request);
         http_respond_200(client_fd, "close ok");
-
-close_cleanup:
-        goto cleanup;
+        return;
     }
 
     http_respond_404(client_fd);
+}
 
-cleanup:
+/* handle post /regist
+   handle post /close
+*/
+static void handle_http_post(int client_fd) {
+    char header_buf[8192];
+    ssize_t n = recv(client_fd, header_buf, sizeof(header_buf) - 1, 0);
+    if (n <= 0) return;
+    header_buf[n] = '\0';
+
+    const char *body = strstr(header_buf, "\r\n\r\n");
+    if (!body) {
+        http_respond_400(client_fd);
+        return;
+    }
+    body += 4;
+
+    const char *cl_hdr = strcasestr(header_buf, "Content-Length:");
+    size_t content_len = cl_hdr ? strtoul(cl_hdr + 15, NULL, 10) : 0;
+    if (content_len > 16384) {
+        http_respond_400(client_fd);
+        return;
+    }
+
+    size_t header_len = body - header_buf;
+    size_t received_body = n - header_len;
+
+    char *body_buf = malloc(content_len + 1);
+    if (!body_buf) {
+        http_respond_500(client_fd, "OOM");
+        return;
+    }
+    memcpy(body_buf, body, received_body);
+
+    while (received_body < content_len) {
+        ssize_t m = recv(client_fd, body_buf + received_body, content_len - received_body, 0);
+        if (m <= 0) break;
+        received_body += m;
+    }
+    body_buf[received_body] = '\0';
+
+    char path[256];
+    if (simple_parse_request(header_buf, path, sizeof(path)) != 0) {
+        http_respond_400(client_fd);
+        free(body_buf);
+        return;
+    }
+
+    HttpPostTask task;
+    task.client_fd = client_fd;
+    strncpy(task.path, path, sizeof(task.path));
+    task.path[sizeof(task.path) - 1] = '\0';
+    task.body = body_buf;
+    task.body_len = received_body;
+
+    dispatch_sync_f(work_q, &task, handle_http_post_on_queue);
+
     free(body_buf);
 }
 
