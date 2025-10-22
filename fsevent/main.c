@@ -721,7 +721,7 @@ static void handle_http_post(int client_fd) {
                 kFSEventStreamCreateFlagWatchRoot;
 
             ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr,
-                                              kFSEventStreamEventIdSinceNow, 0.01, flags);
+                                              kFSEventStreamEventIdSinceNow, 0.000000001, flags);
             CFRelease(arr);
             arr = NULL;
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
@@ -1027,7 +1027,7 @@ int main(int argc, char *argv[]) {
             fs_ctx->info = ctx;
             FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
             kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.01, flags);
+            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.0000001, flags);
             ctx->root = strdup(workspace);
             CFRelease(arr);
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
