@@ -37,6 +37,7 @@
 #include "pb.h"
 #include "uthash.h"
 #include "RepoMap.h"
+#include "FSEventCore.h"
 
 #define WORKER_QUEUE_LABEL "com.example.fsevent.worker"
 #define HTTP_PORT 8079
@@ -1180,19 +1181,36 @@ void handle_signal(int sig) {
 /* prefix key 1 for normal data */
 /* 2 for last start up time  */
 /* 3 for workspace */
-int main(int argc, char *argv[]) {
+
+static int fsevent_core_run_internal(const fsevent_core_configuration *configuration) {
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
+
     size_t size;
     size_t prefix_len = 2;
     char *err = NULL;
     char *value = NULL;
     const char *prefix = "3:";
-    
-    char leveldb_path[PATH_MAX];
-    if (!build_leveldb_storage_path(leveldb_path, sizeof(leveldb_path))) {
-        fprintf(stderr, "Failed to prepare LevelDB container under Application Support\n");
-        return 1;
+
+    int enable_http = 1;
+    if (configuration && configuration->enable_http_server == 0) {
+        enable_http = 0;
+    }
+
+    if (configuration && configuration->workspace_override) {
+        printf("[FSEventCore] Workspace override hint: %s\n", configuration->workspace_override);
+    }
+
+    const char *leveldb_path = NULL;
+    char derived_path[PATH_MAX];
+    if (configuration && configuration->database_path && configuration->database_path[0] != '\0') {
+        leveldb_path = configuration->database_path;
+    } else {
+        if (!build_leveldb_storage_path(derived_path, sizeof(derived_path))) {
+            fprintf(stderr, "Failed to prepare LevelDB container under Application Support\n");
+            return 1;
+        }
+        leveldb_path = derived_path;
     }
 
     // open leveldb
@@ -1205,24 +1223,24 @@ int main(int argc, char *argv[]) {
         leveldb_free(err);
         return 1;
     }
+
     //Get the startup time if not existed in the leveldb
-    
-    value = get_value_from_leveldb(db,"2",&size);
-    if(value != NULL){
+    value = get_value_from_leveldb(db, "2", &size);
+    if (value != NULL) {
         startUpTime = strtoll(value, NULL, 10);
         free(value);
-    }else{
+    } else {
         startUpTime = get_boot_time_microseconds();
     }
-    
+
     work_q = dispatch_queue_create(WORKER_QUEUE_LABEL, DISPATCH_QUEUE_SERIAL);
     repo_map_register_work_queue(work_q);
     // Retrieve the workspace stored in leveldb
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
     leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
     leveldb_iter_seek(it, prefix, prefix_len);
-    
-    while (leveldb_iter_valid(it)){
+
+    while (leveldb_iter_valid(it)) {
         size_t key_len = 0, val_len = 0;
         const char *key = leveldb_iter_key(it, &key_len);
         if (key_len < prefix_len || strncmp(key, prefix, prefix_len) != 0) {
@@ -1257,8 +1275,9 @@ int main(int argc, char *argv[]) {
             CFRelease(s);
             fs_ctx->info = ctx;
             FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
-            kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.0000001, flags);
+                                             kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
+            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.0000001,
+                                              flags);
             ctx->root = strdup(normalized_workspace);
             CFRelease(arr);
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
@@ -1269,9 +1288,10 @@ int main(int argc, char *argv[]) {
                 FSEventStreamRelease(ctx->stream);
                 free(ctx->root);
                 free(ctx);
+                leveldb_iter_next(it);
                 continue;
             }
-            
+
             if (strcmp(workspace, normalized_workspace) != 0) {
                 char *key_copy = malloc(key_len + 1);
                 if (key_copy) {
@@ -1284,22 +1304,24 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            repo_map_add(normalized_workspace, repoid,ctx);
-            // creat stream
-
+            repo_map_add(normalized_workspace, repoid, ctx);
         }
         leveldb_iter_next(it);
     }
     leveldb_iter_destroy(it);
     leveldb_readoptions_destroy(ro);
-    
-    // spawn HTTP server thread
-    pthread_t http_thread;
-    if (pthread_create(&http_thread, NULL, http_server_thread, NULL) != 0) {
-        perror("pthread_create http thread");
-        // continue without http in that case
+
+    if (enable_http) {
+        // spawn HTTP server thread
+        pthread_t http_thread;
+        if (pthread_create(&http_thread, NULL, http_server_thread, NULL) != 0) {
+            perror("pthread_create http thread");
+            // continue without http in that case
+        } else {
+            pthread_detach(http_thread);
+        }
     } else {
-        pthread_detach(http_thread);
+        printf("HTTP server disabled for helper configuration\n");
     }
 
     printf("Watching paths... Ctrl-C to exit\n");
@@ -1309,4 +1331,33 @@ int main(int argc, char *argv[]) {
 
     // cleanup (not usually reached)
     return 0;
+}
+
+int fsevent_core_run(const fsevent_core_configuration *configuration) {
+    fsevent_core_configuration fallback;
+    if (!configuration) {
+        memset(&fallback, 0, sizeof(fallback));
+        configuration = &fallback;
+    }
+    return fsevent_core_run_internal(configuration);
+}
+
+int fsevent_core_run_default(void) {
+    return fsevent_core_run(NULL);
+}
+
+int fsevent_core_prepare_shared_storage(char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return -1;
+    }
+    if (!build_leveldb_storage_path(out, out_size)) {
+        return -1;
+    }
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    return fsevent_core_run_default();
 }
