@@ -13,11 +13,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <time.h>
 #include <fnmatch.h>
+#include <stdbool.h>
+#include <limits.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <signal.h>
 #include <arpa/inet.h>
@@ -33,8 +38,6 @@
 #include "uthash.h"
 #include "RepoMap.h"
 
-#define WORKSPACE "/Users/jexyxiong/testfsevent"
-
 #define WORKER_QUEUE_LABEL "com.example.fsevent.worker"
 #define HTTP_PORT 8079
 #define LISTEN_BACKLOG 32
@@ -49,6 +52,88 @@ typedef struct {
 int64_t startUpTime;
 leveldb_t *db;
 dispatch_queue_t work_q;
+
+static bool ensure_directory_exists(const char *path) {
+    if (!path) return false;
+
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    if (errno != ENOENT) {
+        return false;
+    }
+
+    if (mkdir(path, 0700) == 0) {
+        return true;
+    }
+
+    return errno == EEXIST;
+}
+
+static bool canonicalize_path(const char *input, char *output, size_t size) {
+    if (!input || !output || size == 0) return false;
+    char *resolved = realpath(input, output);
+    if (resolved) return true;
+    return false;
+}
+
+static bool is_path_within_home(const char *path) {
+    const char *home = getenv("HOME");
+    if (!home || !path) return false;
+
+    char resolved_home[PATH_MAX];
+    char resolved_path[PATH_MAX];
+
+    if (!canonicalize_path(home, resolved_home, sizeof(resolved_home))) {
+        return false;
+    }
+    if (!canonicalize_path(path, resolved_path, sizeof(resolved_path))) {
+        return false;
+    }
+
+    size_t home_len = strlen(resolved_home);
+    if (home_len == 0) return false;
+
+    if (strncmp(resolved_path, resolved_home, home_len) != 0) {
+        return false;
+    }
+
+    return resolved_path[home_len] == '\0' || resolved_path[home_len] == '/';
+}
+
+static bool build_leveldb_storage_path(char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') {
+        return false;
+    }
+
+    char intermediate[PATH_MAX];
+    int written = snprintf(intermediate, sizeof(intermediate), "%s/Library", home);
+    if (written < 0 || (size_t)written >= sizeof(intermediate) || !ensure_directory_exists(intermediate)) {
+        return false;
+    }
+
+    written = snprintf(intermediate, sizeof(intermediate), "%s/Library/Application Support", home);
+    if (written < 0 || (size_t)written >= sizeof(intermediate) || !ensure_directory_exists(intermediate)) {
+        return false;
+    }
+
+    written = snprintf(intermediate, sizeof(intermediate), "%s/Library/Application Support/FSEventWatcher", home);
+    if (written < 0 || (size_t)written >= sizeof(intermediate) || !ensure_directory_exists(intermediate)) {
+        return false;
+    }
+
+    written = snprintf(out, out_size, "%s/Library/Application Support/FSEventWatcher/LevelDB", home);
+    if (written < 0 || (size_t)written >= out_size) {
+        return false;
+    }
+
+    return ensure_directory_exists(out);
+}
 /* ---------- utility functions (kept from your original) ---------- */
 
 void print_fsevent_flags(FSEventStreamEventFlags flags) {
@@ -101,7 +186,7 @@ bool should_skip(const char *path, bool is_dir){
     if (strcmp(name, ".hg") == 0) return true;
     if (strcmp(name, ".bzr") == 0) return true;
     if (strcmp(name, ".fslckout") == 0) return true;
-
+    if (strcmp(name, ".fslckout-journal") == 0) return true;
     const char *globs[] = {
         "*~", "*~.*", "#*#", ".#*", "*.swp", "*.swo", "*.swx", ".*.swp",
         ".~lock.*", "*.tmp", "*.temp", "*.part", "*.crdownload", "*.partial",
@@ -335,7 +420,7 @@ static void persist_job_event(Job *job) {
         fprintf(stderr, "Failed to put key %s\n", key);
         goto cleanup;
     }
-    printf("✅ Saved file meta: %s\n", key);
+    printf("✅ Saved file name: %s\n", file.path);
 
 cleanup:
     if (file.path) free(file.path);
@@ -560,6 +645,10 @@ static void http_respond_500(int client, const char *msg) {
                      strlen(msg), msg);
     send_all(client, buf, n);
 }
+static void http_respond_403(int client) {
+    const char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+    send_all(client, resp, strlen(resp));
+}
 static void http_respond_405(int client_fd) {
     const char *msg =
         "HTTP/1.1 405 Method Not Allowed\r\n"
@@ -670,11 +759,22 @@ static void handle_http_get(int client_fd) {
             http_respond_400(client_fd);
             return;
         }
+
+        if (!is_path_within_home(workspace)) {
+            http_respond_403(client_fd);
+            return;
+        }
+
+        char normalized_workspace[PATH_MAX];
+        if (!canonicalize_path(workspace, normalized_workspace, sizeof(normalized_workspace))) {
+            http_respond_400(client_fd);
+            return;
+        }
         int64_t lastsynctime = strtoll(lastsync_str, NULL, 10);
         uint64_t eventid = strtoull(eventid_str, NULL, 10);
         size_t encoded_len = 0;
         int repoid = 0;
-        if (!repo_map_get_repoid(workspace, &repoid)) {
+        if (!repo_map_get_repoid(normalized_workspace, &repoid)) {
             http_respond_404(client_fd);
             return;
         }
@@ -772,7 +872,27 @@ static void handle_http_post(int client_fd) {
             goto cleanup;
         }
 
-        bool already_registered = repo_map_get_repoid(registerdir.path, NULL);
+        struct stat st;
+        if (stat(registerdir.path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            pb_release(RegisterDirectoryRequest_fields, &registerdir);
+            http_respond_400(client_fd);
+            goto cleanup;
+        }
+
+        if (!is_path_within_home(registerdir.path)) {
+            pb_release(RegisterDirectoryRequest_fields, &registerdir);
+            http_respond_403(client_fd);
+            goto cleanup;
+        }
+
+        char normalized_path[PATH_MAX];
+        if (!canonicalize_path(registerdir.path, normalized_path, sizeof(normalized_path))) {
+            pb_release(RegisterDirectoryRequest_fields, &registerdir);
+            http_respond_400(client_fd);
+            goto cleanup;
+        }
+
+        bool already_registered = repo_map_get_repoid(normalized_path, NULL);
         if (!already_registered) {
             FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
             FSEventStreamContext *fs_ctx = calloc(1, sizeof(FSEventStreamContext));
@@ -783,14 +903,14 @@ static void handle_http_post(int client_fd) {
                 goto fs_fail;
             }
 
-            CFStringRef s = CFStringCreateWithCString(NULL, registerdir.path, kCFStringEncodingUTF8);
+            CFStringRef s = CFStringCreateWithCString(NULL, normalized_path, kCFStringEncodingUTF8);
             CFArrayAppendValue(arr, s);
             CFRelease(s);
 
             fs_ctx->info = ctx;
             ctx->fs_ctx = fs_ctx;
             ctx->work_q = work_q;
-            ctx->root = strdup(registerdir.path);
+            ctx->root = strdup(normalized_path);
             if (!ctx->root) {
                 http_respond_500(client_fd, "OOM");
                 goto fs_fail;
@@ -830,7 +950,7 @@ static void handle_http_post(int client_fd) {
                 char workspace[512];
                 memcpy(workspace, val, vlen < sizeof(workspace)-1 ? vlen : sizeof(workspace)-1);
                 workspace[vlen] = '\0';
-                if (strcmp(registerdir.path, workspace) == 0) exist_id = id;
+                if (strcmp(normalized_path, workspace) == 0) exist_id = id;
 
                 leveldb_iter_next(it);
             }
@@ -838,11 +958,11 @@ static void handle_http_post(int client_fd) {
             leveldb_readoptions_destroy(ro);
 
             int repoid = exist_id ? exist_id : (max_id + 1);
-            repo_map_add(registerdir.path, repoid, ctx);
+            repo_map_add(normalized_path, repoid, ctx);
 
             char key[20];
             snprintf(key, sizeof(key), "3:%08d", repoid);
-            put_value_to_leveldb(key, registerdir.path, strlen(registerdir.path));
+            put_value_to_leveldb(key, normalized_path, strlen(normalized_path));
 
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
 
@@ -905,8 +1025,21 @@ static void handle_http_post(int client_fd) {
             goto close_cleanup;
         }
 
+        if (!is_path_within_home(request.path)) {
+            pb_release(RegisterDirectoryRequest_fields, &request);
+            http_respond_403(client_fd);
+            goto close_cleanup;
+        }
+
+        char normalized_path[PATH_MAX];
+        if (!canonicalize_path(request.path, normalized_path, sizeof(normalized_path))) {
+            pb_release(RegisterDirectoryRequest_fields, &request);
+            http_respond_400(client_fd);
+            goto close_cleanup;
+        }
+
         int repoid = -1;
-        if (!repo_map_remove(request.path, &repoid)) {
+        if (!repo_map_remove(normalized_path, &repoid)) {
             pb_release(RegisterDirectoryRequest_fields, &request);
             http_respond_404(client_fd);
             goto close_cleanup;
@@ -979,7 +1112,7 @@ static void *http_server_thread(void *arg) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(HTTP_PORT);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1056,10 +1189,16 @@ int main(int argc, char *argv[]) {
     char *value = NULL;
     const char *prefix = "3:";
     
+    char leveldb_path[PATH_MAX];
+    if (!build_leveldb_storage_path(leveldb_path, sizeof(leveldb_path))) {
+        fprintf(stderr, "Failed to prepare LevelDB container under Application Support\n");
+        return 1;
+    }
+
     // open leveldb
     leveldb_options_t *options = leveldb_options_create();
     leveldb_options_set_create_if_missing(options, 1);
-    db = leveldb_open(options, "/Users/jexyxiong/.vblevel", &err);
+    db = leveldb_open(options, leveldb_path, &err);
     leveldb_options_destroy(options);
     if (err != NULL) {
         printf("open leveldb failed: %s\n", err);
@@ -1095,7 +1234,17 @@ int main(int argc, char *argv[]) {
         size_t len = val_len < sizeof(workspace) - 1 ? val_len : sizeof(workspace) - 1;
         memcpy(workspace, val, len);
         workspace[len] = '\0';
-        if (access(workspace, F_OK) == 0) {
+        if (access(workspace, F_OK) == 0 && is_path_within_home(workspace)) {
+            struct stat st;
+            if (stat(workspace, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                leveldb_iter_next(it);
+                continue;
+            }
+            char normalized_workspace[PATH_MAX];
+            if (!canonicalize_path(workspace, normalized_workspace, sizeof(normalized_workspace))) {
+                leveldb_iter_next(it);
+                continue;
+            }
             FSEventsStream *ctx = malloc(sizeof(FSEventsStream));
             memset(ctx, 0, sizeof(FSEventsStream));
             FSEventStreamContext *fs_ctx = malloc(sizeof(FSEventStreamContext));
@@ -1103,14 +1252,14 @@ int main(int argc, char *argv[]) {
             ctx->work_q = work_q;
             ctx->fs_ctx = fs_ctx;
             CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-            CFStringRef s = CFStringCreateWithCString(NULL, workspace, kCFStringEncodingUTF8);
+            CFStringRef s = CFStringCreateWithCString(NULL, normalized_workspace, kCFStringEncodingUTF8);
             CFArrayAppendValue(arr, s);
             CFRelease(s);
             fs_ctx->info = ctx;
             FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
             kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
             ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.0000001, flags);
-            ctx->root = strdup(workspace);
+            ctx->root = strdup(normalized_workspace);
             CFRelease(arr);
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
             if (!FSEventStreamStart(ctx->stream)) {
@@ -1123,9 +1272,21 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             
-            repo_map_add(workspace, repoid,ctx);
+            if (strcmp(workspace, normalized_workspace) != 0) {
+                char *key_copy = malloc(key_len + 1);
+                if (key_copy) {
+                    memcpy(key_copy, key, key_len);
+                    key_copy[key_len] = '\0';
+                    if (put_value_to_leveldb(key_copy, normalized_workspace, strlen(normalized_workspace)) != 0) {
+                        fprintf(stderr, "Failed to normalize stored workspace path for repo %d\n", repoid);
+                    }
+                    free(key_copy);
+                }
+            }
+
+            repo_map_add(normalized_workspace, repoid,ctx);
             // creat stream
-            
+
         }
         leveldb_iter_next(it);
     }
