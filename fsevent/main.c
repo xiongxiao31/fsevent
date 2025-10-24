@@ -1,11 +1,10 @@
 // main.c
 // Compile (example):
-// clang main.c -framework CoreServices -framework CoreFoundation -lsqlite3 -lpthread -lleveldb -o fsevent_vcs
+// clang main.c -framework CoreServices -framework CoreFoundation -lpthread -lleveldb -o fsevent_vcs
 //
 // 注意：根据你的系统 link flags 和 leveldb 安装方式可能需调整 -lleveldb 路径/选项
 
 #include <CoreServices/CoreServices.h>
-#include <sqlite3.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach/mach_time.h>
 #include <ftw.h>
@@ -760,10 +759,10 @@ static void handle_http_get(int client_fd) {
             return;
         }
 
-        if (!is_path_within_home(workspace)) {
-            http_respond_403(client_fd);
-            return;
-        }
+//        if (!is_path_within_home(workspace)) {
+//            http_respond_403(client_fd);
+//            return;
+//        }
 
         char normalized_workspace[PATH_MAX];
         if (!canonicalize_path(workspace, normalized_workspace, sizeof(normalized_workspace))) {
@@ -879,11 +878,11 @@ static void handle_http_post(int client_fd) {
             goto cleanup;
         }
 
-        if (!is_path_within_home(registerdir.path)) {
-            pb_release(RegisterDirectoryRequest_fields, &registerdir);
-            http_respond_403(client_fd);
-            goto cleanup;
-        }
+//        if (!is_path_within_home(registerdir.path)) {
+//            pb_release(RegisterDirectoryRequest_fields, &registerdir);
+//            http_respond_403(client_fd);
+//            goto cleanup;
+//        }
 
         char normalized_path[PATH_MAX];
         if (!canonicalize_path(registerdir.path, normalized_path, sizeof(normalized_path))) {
@@ -1025,11 +1024,11 @@ static void handle_http_post(int client_fd) {
             goto close_cleanup;
         }
 
-        if (!is_path_within_home(request.path)) {
-            pb_release(RegisterDirectoryRequest_fields, &request);
-            http_respond_403(client_fd);
-            goto close_cleanup;
-        }
+//        if (!is_path_within_home(request.path)) {
+//            pb_release(RegisterDirectoryRequest_fields, &request);
+//            http_respond_403(client_fd);
+//            goto close_cleanup;
+//        }
 
         char normalized_path[PATH_MAX];
         if (!canonicalize_path(request.path, normalized_path, sizeof(normalized_path))) {
