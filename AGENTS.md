@@ -69,3 +69,5 @@ All network-facing payloads are nanopb-encoded and decoded via pb.h and generate
 - On registration, insert a key 3:<repoid> with value=path.
 - On shutdown, persist the latest time under key 2. 
 - Please be sure to avoid memory leakage.
+
+- 请用中文回答我的问题

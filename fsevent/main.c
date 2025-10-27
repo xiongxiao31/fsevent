@@ -210,18 +210,18 @@ bool should_skip(const char *path, bool is_dir){
     return false;
 }
 
-int64_t mach_absolute_time_to_us(uint64_t ticks) {
+int64_t mach_absolute_time_to_ns(uint64_t ticks) {
     static mach_timebase_info_data_t timebase = {0,0};
     if (timebase.denom == 0) {
         mach_timebase_info(&timebase);
     }
     uint64_t ns = ticks * timebase.numer / timebase.denom;
-    return ns / 1000;
+    return (int64_t)ns;
 }
 /* ---------- LevelDB helpers with locking ---------- */
 
 /* get_value_from_leveldb: thread-safe read wrapper
- * returns malloc'd buffer (value), sets *vlen; caller must free().
+ * returns LevelDB-owned buffer (value), sets *vlen; caller must release via leveldb_free().
  * returns NULL if not found or error.
  */
 char *get_value_from_leveldb(leveldb_t *db, const char *key, size_t *vlen) {
@@ -304,7 +304,7 @@ uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) 
     }
     if(payload.files_count==0){
         uint64_t ticks = mach_absolute_time();
-        int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
+        int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
         payload.lastUpdatedTime = timeNow;
     }
     leveldb_iter_destroy(it);
@@ -392,7 +392,7 @@ static void persist_job_event(Job *job) {
     bool status;
     size_t message_length;
     uint64_t ticks = mach_absolute_time();
-    int64_t time_now = mach_absolute_time_to_us(ticks) + startUpTime;
+    int64_t time_now = mach_absolute_time_to_ns(ticks) + startUpTime;
 
     file.path = strdup(job->path);
     file.flag = job->flag;
@@ -966,7 +966,7 @@ static void handle_http_post(int client_fd) {
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
 
             uint64_t ticks = mach_absolute_time();
-            int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
+            int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
             char resp[32];
             snprintf(resp, sizeof(resp), "%lld", timeNow);
             http_respond_200(client_fd, resp);
@@ -1002,7 +1002,7 @@ static void handle_http_post(int client_fd) {
 
         pb_release(RegisterDirectoryRequest_fields, &registerdir);
         uint64_t ticks = mach_absolute_time();
-        int64_t timeNow = mach_absolute_time_to_us(ticks) + startUpTime;
+        int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
         char resp[32];
         snprintf(resp, sizeof(resp), "%lld", timeNow);
         http_respond_200(client_fd, resp);
@@ -1148,27 +1148,29 @@ static void *http_server_thread(void *arg) {
 }
 
 
-int64_t get_boot_time_microseconds(void) {
+int64_t get_boot_time_nanoseconds(void) {
     struct timeval boottime;
     size_t size = sizeof(boottime);
     int mib[2] = { CTL_KERN, KERN_BOOTTIME };
     struct timeval now;
     gettimeofday(&now, NULL);
-    int64_t default_boot_us = ((int64_t)now.tv_sec - 60) * 1000000LL + now.tv_usec;
+    int64_t default_boot_ns =
+        ((int64_t)now.tv_sec - 60) * 1000000000LL + (int64_t)now.tv_usec * 1000LL;
 
     if (sysctl(mib, 2, &boottime, &size, NULL, 0) == 0 && boottime.tv_sec > 0) {
-        int64_t boot_us = (int64_t)boottime.tv_sec * 1000000LL + (int64_t)boottime.tv_usec;
-        if (boot_us > default_boot_us) {
-            return default_boot_us;
+        int64_t boot_ns =
+            (int64_t)boottime.tv_sec * 1000000000LL + (int64_t)boottime.tv_usec * 1000LL;
+        if (boot_ns > default_boot_ns) {
+            return default_boot_ns;
         }
-        return boot_us;
+        return boot_ns;
     }
-    return default_boot_us;
+    return default_boot_ns;
 }
 void handle_signal(int sig) {
     char buf[32];
     uint64_t ticks = mach_absolute_time();
-    snprintf(buf, sizeof(buf), "%"PRId64,startUpTime+mach_absolute_time_to_us(ticks));
+    snprintf(buf, sizeof(buf), "%"PRId64,startUpTime+mach_absolute_time_to_ns(ticks));
     put_value_to_leveldb("2",(const char *)buf,strlen(buf));
     leveldb_close(db);
     exit(0);
@@ -1207,11 +1209,18 @@ int main(int argc, char *argv[]) {
     //Get the startup time if not existed in the leveldb
     
     value = get_value_from_leveldb(db,"2",&size);
-    if(value != NULL){
-        startUpTime = strtoll(value, NULL, 10);
-        free(value);
-    }else{
-        startUpTime = get_boot_time_microseconds();
+    if (value != NULL) {
+        char buf[32];
+        size_t copy_len = size < sizeof(buf) - 1 ? size : sizeof(buf) - 1;
+        memcpy(buf, value, copy_len);
+        buf[copy_len] = '\0';
+        startUpTime = strtoll(buf, NULL, 10);
+        leveldb_free(value);
+        if (startUpTime < 100000000000000000LL) {
+            startUpTime *= 1000;
+        }
+    } else {
+        startUpTime = get_boot_time_nanoseconds();
     }
     
     work_q = dispatch_queue_create(WORKER_QUEUE_LABEL, DISPATCH_QUEUE_SERIAL);
