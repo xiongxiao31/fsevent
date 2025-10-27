@@ -259,6 +259,34 @@ uint64_t extract_end(const char *str) {
     buf[20] = '\0';
     return strtoull(buf, NULL, 10);
 }
+
+static FSEventStreamEventId get_last_event_id_for_repo(int repoid) {
+    if (repoid < 0) return 0;
+
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "1:%08d:", repoid);
+    size_t prefix_len = strlen(prefix);
+
+    leveldb_readoptions_t *ro = leveldb_readoptions_create();
+    leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
+    leveldb_iter_seek(it, prefix, prefix_len);
+
+    FSEventStreamEventId last_event_id = 0;
+    while (leveldb_iter_valid(it)) {
+        size_t key_len = 0;
+        const char *key = leveldb_iter_key(it, &key_len);
+        if (key_len < prefix_len || strncmp(key, prefix, prefix_len) != 0) {
+            break;
+        }
+
+        last_event_id = extract_end(key);
+        leveldb_iter_next(it);
+    }
+
+    leveldb_iter_destroy(it);
+    leveldb_readoptions_destroy(ro);
+    return last_event_id;
+}
 uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) {
     if (!db || !prefix || !encoded_len) return NULL;
     *encoded_len = 0;
@@ -419,7 +447,7 @@ static void persist_job_event(Job *job) {
         fprintf(stderr, "Failed to put key %s\n", key);
         goto cleanup;
     }
-    printf("✅ Saved file name: %s\n", file.path);
+    printf("✅ Saved file name: %s\n key:%s\n", file.path,key);
 
 cleanup:
     if (file.path) free(file.path);
@@ -580,7 +608,6 @@ static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallB
                 job->flag = flags;
                 job->eventid = eventIds[i];
                 job->root = strdup(root);
-                printf("Dir changed: %s (flag 0x%x)\n", p, (int)flags);
                 dispatch_async_f(work_q, job, dispatch_worker_func_dir);
             }
         }
@@ -1052,6 +1079,7 @@ static void handle_http_post(int client_fd) {
                 http_respond_500(client_fd, "Failed to remove workspace");
                 goto close_cleanup;
             }
+            remove_repo_entries_from_leveldb(repoid);
         }
 
         pb_release(RegisterDirectoryRequest_fields, &request);
@@ -1266,7 +1294,9 @@ int main(int argc, char *argv[]) {
             fs_ctx->info = ctx;
             FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
             kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, kFSEventStreamEventIdSinceNow, 0.0000001, flags);
+            FSEventStreamEventId last_event_id = get_last_event_id_for_repo(repoid);
+            FSEventStreamEventId since_when = last_event_id > 0 ? last_event_id : kFSEventStreamEventIdSinceNow;
+            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, since_when, 0.0000001, flags);
             ctx->root = strdup(normalized_workspace);
             CFRelease(arr);
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
