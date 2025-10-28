@@ -1,8 +1,8 @@
 #include "RepoMap.h"
+#include "FSEventsStream.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <CoreServices/CoreServices.h>
 
 RepoMapEntry *g_repo_map = NULL;
 pthread_mutex_t gRepoMapLock = PTHREAD_MUTEX_INITIALIZER;

@@ -4,11 +4,6 @@
 //
 // 注意：根据你的系统 link flags 和 leveldb 安装方式可能需调整 -lleveldb 路径/选项
 
-#include <CoreServices/CoreServices.h>
-#include <CommonCrypto/CommonDigest.h>
-#include <mach/mach_time.h>
-#include <ftw.h>
-#include <dispatch/dispatch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +13,6 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
-#include <fnmatch.h>
 #include <stdbool.h>
 #include <limits.h>
 #include <ctype.h>
@@ -36,21 +30,15 @@
 #include "pb.h"
 #include "uthash.h"
 #include "RepoMap.h"
-
-#define WORKER_QUEUE_LABEL "com.example.fsevent.worker"
+#include "leveldb_helpers.h"
+#include "platform_fsevent.h"
 #define HTTP_PORT 8079
 #define LISTEN_BACKLOG 32
 
 
-typedef struct {
-    char *path; // strdup'd
-    char *root;
-    int64_t flag;
-    uint64 eventid;
-} Job;
 int64_t startUpTime;
 leveldb_t *db;
-dispatch_queue_t work_q;
+static struct PlatformState *platform_state;
 
 static bool ensure_directory_exists(const char *path) {
     if (!path) return false;
@@ -133,91 +121,6 @@ static bool build_leveldb_storage_path(char *out, size_t out_size) {
 
     return ensure_directory_exists(out);
 }
-/* ---------- utility functions (kept from your original) ---------- */
-
-void print_fsevent_flags(FSEventStreamEventFlags flags) {
-    if (flags == kFSEventStreamEventFlagNone) printf(" - None\n");
-    if (flags & kFSEventStreamEventFlagMustScanSubDirs) printf(" - MustScanSubDirs\n");
-    if (flags & kFSEventStreamEventFlagUserDropped) printf(" - UserDropped\n");
-    if (flags & kFSEventStreamEventFlagKernelDropped) printf(" - KernelDropped\n");
-    if (flags & kFSEventStreamEventFlagEventIdsWrapped) printf(" - EventIdsWrapped\n");
-    if (flags & kFSEventStreamEventFlagHistoryDone) printf(" - HistoryDone\n");
-    if (flags & kFSEventStreamEventFlagRootChanged) printf(" - RootChanged\n");
-    if (flags & kFSEventStreamEventFlagMount) printf(" - Mount\n");
-    if (flags & kFSEventStreamEventFlagUnmount) printf(" - Unmount\n");
-    if (flags & kFSEventStreamEventFlagItemCreated) printf(" - ItemCreated\n");
-    if (flags & kFSEventStreamEventFlagItemRemoved) printf(" - ItemRemoved\n");
-    if (flags & kFSEventStreamEventFlagItemInodeMetaMod) printf(" - ItemInodeMetaMod\n");
-    if (flags & kFSEventStreamEventFlagItemRenamed) printf(" - ItemRenamed\n");
-    if (flags & kFSEventStreamEventFlagItemModified) printf(" - ItemModified\n");
-    if (flags & kFSEventStreamEventFlagItemFinderInfoMod) printf(" - ItemFinderInfoMod\n");
-    if (flags & kFSEventStreamEventFlagItemChangeOwner) printf(" - ItemChangeOwner\n");
-    if (flags & kFSEventStreamEventFlagItemXattrMod) printf(" - ItemXattrMod\n");
-    if (flags & kFSEventStreamEventFlagItemIsFile) printf(" - ItemIsFile\n");
-    if (flags & kFSEventStreamEventFlagItemIsDir) printf(" - ItemIsDir\n");
-    if (flags & kFSEventStreamEventFlagItemIsSymlink) printf(" - ItemIsSymlink\n");
-    if (flags & kFSEventStreamEventFlagOwnEvent) printf(" - OwnEvent\n");
-    if (flags & kFSEventStreamEventFlagItemIsHardlink) printf(" - ItemIsHardlink\n");
-    if (flags & kFSEventStreamEventFlagItemIsLastHardlink) printf(" - ItemIsLastHardlink\n");
-}
-
-/* basename_of / should_skip from your original (unchanged) */
-static const char *basename_of(const char *path){
-    const char *p = strrchr(path, '/');
-    if (p) return p + 1;
-    p = strrchr(path, '\\');
-    if (p) return p + 1;
-    return path;
-}
-bool should_skip(const char *path, bool is_dir){
-    const char *name = basename_of(path);
-    if (strcmp(name, ".DS_Store") == 0) return true;
-    if (strcmp(name, "Thumbs.db") == 0) return true;
-    if (strcmp(name, "desktop.ini") == 0) return true;
-    if (strcmp(name, "Icon\r") == 0) return true;
-    if (strcmp(name, ".Spotlight-V100") == 0) return true;
-    if (strcmp(name, ".Trashes") == 0) return true;
-    if (strcmp(name, ".fseventsd") == 0) return true;
-    if (strcmp(name, ".TemporaryItems") == 0) return true;
-    if (strcmp(name, ".git") == 0) return true;
-    if (strcmp(name, ".gitignore") == 0) return true;
-    if (strcmp(name, ".svn") == 0) return true;
-    if (strcmp(name, ".hg") == 0) return true;
-    if (strcmp(name, ".bzr") == 0) return true;
-    if (strcmp(name, ".fslckout") == 0) return true;
-    if (strcmp(name, ".fslckout-journal") == 0) return true;
-    const char *globs[] = {
-        "*~", "*~.*", "#*#", ".#*", "*.swp", "*.swo", "*.swx", ".*.swp",
-        ".~lock.*", "*.tmp", "*.temp", "*.part", "*.crdownload", "*.partial",
-        "~$*", ".~*", "._*", "ehthumbs.db"
-    };
-    for (size_t i = 0; i < sizeof(globs)/sizeof(globs[0]); ++i){
-        if (fnmatch(globs[i], name, 0) == 0) return true;
-    }
-
-    if (name[0] == '~') return true;
-    if (strstr(name, ".swp") || strstr(name, ".swo")) return true;
-
-    // 新增：忽略所有以 -shm 或 -wal 结尾的文件
-    size_t len = strlen(name);
-    if (len > 4 && strcmp(name + len - 4, "-shm") == 0) return true;
-    if (len > 4 && strcmp(name + len - 4, "-wal") == 0) return true;
-
-    if (is_dir){
-        if (strcmp(name, "__MACOSX") == 0) return true;
-        if (strcmp(name, "node_modules") == 0) return true;
-    }
-    return false;
-}
-
-int64_t mach_absolute_time_to_ns(uint64_t ticks) {
-    static mach_timebase_info_data_t timebase = {0,0};
-    if (timebase.denom == 0) {
-        mach_timebase_info(&timebase);
-    }
-    uint64_t ns = ticks * timebase.numer / timebase.denom;
-    return (int64_t)ns;
-}
 /* ---------- LevelDB helpers with locking ---------- */
 
 /* get_value_from_leveldb: thread-safe read wrapper
@@ -260,18 +163,18 @@ uint64_t extract_end(const char *str) {
     return strtoull(buf, NULL, 10);
 }
 
-static FSEventStreamEventId get_last_event_id_for_repo(int repoid) {
-    if (repoid < 0) return 0;
+uint64_t get_last_event_id_for_repo(leveldb_t *db_handle, int repoid) {
+    if (!db_handle || repoid < 0) return 0;
 
     char prefix[32];
     snprintf(prefix, sizeof(prefix), "1:%08d:", repoid);
     size_t prefix_len = strlen(prefix);
 
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
-    leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
+    leveldb_iterator_t *it = leveldb_create_iterator(db_handle, ro);
     leveldb_iter_seek(it, prefix, prefix_len);
 
-    FSEventStreamEventId last_event_id = 0;
+    uint64_t last_event_id = 0;
     while (leveldb_iter_valid(it)) {
         size_t key_len = 0;
         const char *key = leveldb_iter_key(it, &key_len);
@@ -287,12 +190,12 @@ static FSEventStreamEventId get_last_event_id_for_repo(int repoid) {
     leveldb_readoptions_destroy(ro);
     return last_event_id;
 }
-uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) {
-    if (!db || !prefix || !encoded_len) return NULL;
+uint8_t *get_encoded_payload_by_prefix(leveldb_t *db_handle, const char *prefix, size_t *encoded_len, int64_t fallback_time) {
+    if (!db_handle || !prefix || !encoded_len) return NULL;
     *encoded_len = 0;
     size_t prefix_len = strlen(prefix);
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
-    leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
+    leveldb_iterator_t *it = leveldb_create_iterator(db_handle, ro);
     leveldb_iter_seek(it, prefix, prefix_len);
     FileEventBatch payload = FileEventBatch_init_default;
     payload.files_count = 0;
@@ -331,9 +234,7 @@ uint8_t *get_encoded_payload_by_prefix(const char *prefix, size_t *encoded_len) 
         leveldb_iter_next(it);
     }
     if(payload.files_count==0){
-        uint64_t ticks = mach_absolute_time();
-        int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
-        payload.lastUpdatedTime = timeNow;
+        payload.lastUpdatedTime = fallback_time;
     }
     leveldb_iter_destroy(it);
     leveldb_readoptions_destroy(ro);
@@ -381,10 +282,13 @@ fail:
     return NULL;
 }
 /* put_value_to_leveldb: thread-safe write wrapper */
-int put_value_to_leveldb(const char *key, const char *value, size_t vlen) {
+int put_value_to_leveldb(leveldb_t *db_handle, const char *key, const char *value, size_t vlen) {
+    if (!db_handle || !key || !value) {
+        return -1;
+    }
     char *err = NULL;
     leveldb_writeoptions_t *woptions = leveldb_writeoptions_create();
-    leveldb_put(db, woptions, key, strlen(key), value, vlen, &err);
+    leveldb_put(db_handle, woptions, key, strlen(key), value, vlen, &err);
     leveldb_writeoptions_destroy(woptions);
     if (err) {
         fprintf(stderr, "LevelDB put failed: %s\n", err);
@@ -394,12 +298,12 @@ int put_value_to_leveldb(const char *key, const char *value, size_t vlen) {
     return 0;
 }
 
-int delete_value_from_leveldb(const char *key) {
-    if (!key) return -1;
+int delete_value_from_leveldb(leveldb_t *db_handle, const char *key) {
+    if (!db_handle || !key) return -1;
 
     char *err = NULL;
     leveldb_writeoptions_t *woptions = leveldb_writeoptions_create();
-    leveldb_delete(db, woptions, key, strlen(key), &err);
+    leveldb_delete(db_handle, woptions, key, strlen(key), &err);
     leveldb_writeoptions_destroy(woptions);
     if (err) {
         fprintf(stderr, "LevelDB delete failed: %s\n", err);
@@ -409,59 +313,15 @@ int delete_value_from_leveldb(const char *key) {
     return 0;
 }
 
-/* ---------- Your original process_path but using the write wrapper ---------- */
-static void persist_job_event(Job *job) {
-    if (!job || !job->path || !job->root) {
-        goto cleanup;
-    }
-
-    FileEventMeta file = FileEventMeta_init_default;
-    uint8_t buffer[4096];
-    bool status;
-    size_t message_length;
-    uint64_t ticks = mach_absolute_time();
-    int64_t time_now = mach_absolute_time_to_ns(ticks) + startUpTime;
-
-    file.path = strdup(job->path);
-    file.flag = job->flag;
-
-    pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
-    status = pb_encode(&stream, FileEventMeta_fields, &file);
-    message_length = stream.bytes_written;
-    if (!status) {
-        printf("Encode failed: %s\n", PB_GET_ERROR(&stream));
-        goto cleanup;
-    }
-
-    int repoid = 0;
-    if (!repo_map_get_repoid(job->root, &repoid)) {
-        fprintf(stderr, "Failed to resolve repo for %s\n", job->root);
-        goto cleanup;
-    }
-
-    uint64_t event_id = job->eventid ? job->eventid : (uint64_t)time_now;
-    char key[128];
-    snprintf(key, sizeof(key), "1:%08d:%020lld:%020llu", repoid, time_now, event_id);
-
-    if (put_value_to_leveldb(key, (const char *)buffer, message_length) != 0) {
-        fprintf(stderr, "Failed to put key %s\n", key);
-        goto cleanup;
-    }
-    printf("✅ Saved file name: %s\n key:%s\n", file.path,key);
-
-cleanup:
-    if (file.path) free(file.path);
-}
-
-static void remove_repo_entries_from_leveldb(int repoid) {
-    if (repoid < 0) return;
+void remove_repo_entries_from_leveldb(leveldb_t *db_handle, int repoid) {
+    if (!db_handle || repoid < 0) return;
 
     char prefix[32];
     snprintf(prefix, sizeof(prefix), "1:%08d:", repoid);
     size_t prefix_len = strlen(prefix);
 
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
-    leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
+    leveldb_iterator_t *it = leveldb_create_iterator(db_handle, ro);
     leveldb_iter_seek(it, prefix, prefix_len);
 
     char **keys = NULL;
@@ -504,7 +364,7 @@ static void remove_repo_entries_from_leveldb(int repoid) {
     leveldb_readoptions_destroy(ro);
 
     for (size_t i = 0; i < key_count; ++i) {
-        if (delete_value_from_leveldb(keys[i]) != 0) {
+        if (delete_value_from_leveldb(db_handle, keys[i]) != 0) {
             fprintf(stderr, "Failed to delete key %s for repo %d\n", keys[i], repoid);
         }
         free(keys[i]);
@@ -513,116 +373,9 @@ static void remove_repo_entries_from_leveldb(int repoid) {
 
     char repo_key[20];
     snprintf(repo_key, sizeof(repo_key), "3:%08d", repoid);
-    if (delete_value_from_leveldb(repo_key) != 0) {
+    if (delete_value_from_leveldb(db_handle, repo_key) != 0) {
         fprintf(stderr, "Failed to delete repo key %s\n", repo_key);
     }
-}
-
-static void process_path(Job *job) {
-    persist_job_event(job);
-
-    if (job) {
-        if (job->path) free(job->path);
-        if (job->root) free(job->root);
-        free(job);
-    }
-}
-
-static void process_dir(Job *job) {
-    if (!job) return;
-
-    if (!(job->flag & kFSEventStreamEventFlagItemIsDir)) {
-        job->flag |= kFSEventStreamEventFlagItemIsDir;
-    }
-
-    persist_job_event(job);
-
-    if (job->path) free(job->path);
-    if (job->root) free(job->root);
-    free(job);
-}
-
-/* dispatch wrappers */
-static void dispatch_worker_func(void *vjob) {
-    Job *job = (Job*)vjob;
-    process_path(job);
-}
-static void dispatch_worker_func_dir(void *vjob) {
-    Job *job = (Job*)vjob;
-    process_dir(job);
-}
-
-
-static void schedule_full_rescan(FSEventsStream *c) {
-    // reocde root path to leveldb send back to the client
-    // inform client to do a full rescan
-    
-}
-
-/* FSEvents callback (uses dispatch to enqueue jobs) */
-static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallBackInfo, size_t numEvents, void *eventPaths, const FSEventStreamEventFlags eventFlags[], const FSEventStreamEventId eventIds[]) {
-    FSEventsStream *c = (FSEventsStream*)clientCallBackInfo;
-    char * root = strdup(c->root);
-    char **paths = eventPaths;
-    bool root_changed = false;
-    for (size_t i = 0; i < numEvents; i++) {
-        const char *p = paths[i];
-        FSEventStreamEventFlags flags = eventFlags[i];
-
-        if (flags & kFSEventStreamEventFlagRootChanged) {
-            root_changed = true;
-            fprintf(stderr, "Root changed detected for %s, cleaning up.\n", root);
-            continue;
-        }
-
-        if(flags &(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)){
-            if(should_skip(p, false)) continue;
-        } else if(flags & kFSEventStreamEventFlagItemIsDir){
-            if(should_skip(p, true)) continue;
-        }
-
-        printf("path: %s %d\n", p, (int)flags);
-        print_fsevent_flags(flags);
-
-        if(flags == (kFSEventStreamEventFlagItemXattrMod | kFSEventStreamEventFlagItemIsFile)){
-            continue;
-        }
-
-        if (flags & kFSEventStreamEventFlagKernelDropped || flags & kFSEventStreamEventFlagUserDropped) {
-            fprintf(stderr, "FSEvents reported dropped events (kernel/user). Scheduling full rescan.\n");
-            schedule_full_rescan(c);
-            continue;
-        }
-
-        if(flags &(kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemModified)){
-            if (flags & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink | kFSEventStreamEventFlagItemIsHardlink)) {
-                Job *job = malloc(sizeof(Job));
-                job->path = strdup(p);
-                job->flag = flags;
-                job->eventid = eventIds[i];
-                job->root = strdup(root);
-                dispatch_async_f(work_q, job, dispatch_worker_func);
-            } else if (flags & kFSEventStreamEventFlagItemIsDir) {
-                Job *job = malloc(sizeof(Job));
-                job->path = strdup(p);
-                job->flag = flags;
-                job->eventid = eventIds[i];
-                job->root = strdup(root);
-                dispatch_async_f(work_q, job, dispatch_worker_func_dir);
-            }
-        }
-    }
-
-    if (root_changed) {
-        int repoid = -1;
-        if (repo_map_remove(root, &repoid)) {
-            remove_repo_entries_from_leveldb(repoid);
-        } else {
-            fprintf(stderr, "Failed to remove repo map entry for %s after root change.\n", root);
-        }
-    }
-
-    free(root);
 }
 
 /* ---------- Simple HTTP server (multithreaded) ---------- */
@@ -813,7 +566,8 @@ static void handle_http_get(int client_fd) {
             snprintf(key, sizeof(key), "1:%08d:", repoid);
         }
         
-        uint8_t *encoded_payload = get_encoded_payload_by_prefix( key, &encoded_len);
+        int64_t fallback_time = platform_state_current_time(platform_state);
+        uint8_t *encoded_payload = get_encoded_payload_by_prefix(db, key, &encoded_len, fallback_time);
         if (!encoded_payload) {
             http_respond_404(client_fd);
             return;
@@ -920,46 +674,6 @@ static void handle_http_post(int client_fd) {
 
         bool already_registered = repo_map_get_repoid(normalized_path, NULL);
         if (!already_registered) {
-            FSEventsStream *ctx = calloc(1, sizeof(FSEventsStream));
-            FSEventStreamContext *fs_ctx = calloc(1, sizeof(FSEventStreamContext));
-            CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-
-            if (!ctx || !fs_ctx || !arr) {
-                http_respond_500(client_fd, "Alloc failed");
-                goto fs_fail;
-            }
-
-            CFStringRef s = CFStringCreateWithCString(NULL, normalized_path, kCFStringEncodingUTF8);
-            CFArrayAppendValue(arr, s);
-            CFRelease(s);
-
-            fs_ctx->info = ctx;
-            ctx->fs_ctx = fs_ctx;
-            ctx->work_q = work_q;
-            ctx->root = strdup(normalized_path);
-            if (!ctx->root) {
-                http_respond_500(client_fd, "OOM");
-                goto fs_fail;
-            }
-
-            FSEventStreamCreateFlags flags =
-                kFSEventStreamCreateFlagFileEvents |
-                kFSEventStreamCreateFlagNoDefer |
-                kFSEventStreamCreateFlagIgnoreSelf |
-                kFSEventStreamCreateFlagWatchRoot;
-
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr,
-                                              kFSEventStreamEventIdSinceNow, 0.000000001, flags);
-            CFRelease(arr);
-            arr = NULL;
-            FSEventStreamSetDispatchQueue(ctx->stream, work_q);
-            if (!ctx->stream || !FSEventStreamStart(ctx->stream)) {
-                fprintf(stderr, "FSEvent start failed\n");
-                http_respond_500(client_fd, "Stream create failed");
-                goto fs_fail;
-            }
-
-            // 找最大 repoID
             int max_id = 0;
             int exist_id = 0;
             leveldb_readoptions_t *ro = leveldb_readoptions_create();
@@ -984,52 +698,32 @@ static void handle_http_post(int client_fd) {
             leveldb_readoptions_destroy(ro);
 
             int repoid = exist_id ? exist_id : (max_id + 1);
-            repo_map_add(normalized_path, repoid, ctx);
+            if (!platform_state_register_workspace(platform_state, normalized_path, repoid, 0)) {
+                http_respond_500(client_fd, "Stream create failed");
+                pb_release(RegisterDirectoryRequest_fields, &registerdir);
+                goto cleanup;
+            }
 
             char key[20];
             snprintf(key, sizeof(key), "3:%08d", repoid);
-            put_value_to_leveldb(key, normalized_path, strlen(normalized_path));
+            if (put_value_to_leveldb(db, key, normalized_path, strlen(normalized_path)) != 0) {
+                repo_map_remove(normalized_path, NULL);
+                http_respond_500(client_fd, "Failed to persist workspace");
+                pb_release(RegisterDirectoryRequest_fields, &registerdir);
+                goto cleanup;
+            }
 
             pb_release(RegisterDirectoryRequest_fields, &registerdir);
 
-            uint64_t ticks = mach_absolute_time();
-            int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
+            int64_t timeNow = platform_state_current_time(platform_state);
             char resp[32];
             snprintf(resp, sizeof(resp), "%lld", timeNow);
             http_respond_200(client_fd, resp);
             goto cleanup;
-
-        fs_fail:
-            if (arr) {
-                CFRelease(arr);
-                arr = NULL;
-            }
-            if (ctx) {
-                if (ctx->stream) {
-                    FSEventStreamStop(ctx->stream);
-                    FSEventStreamInvalidate(ctx->stream);
-                    FSEventStreamRelease(ctx->stream);
-                }
-                free(ctx->root);
-                if (ctx->fs_ctx) {
-                    free(ctx->fs_ctx);
-                    ctx->fs_ctx = NULL;
-                    fs_ctx = NULL;
-                }
-                free(ctx);
-                ctx = NULL;
-            }
-            if (fs_ctx) {
-                free(fs_ctx);
-                fs_ctx = NULL;
-            }
-            pb_release(RegisterDirectoryRequest_fields, &registerdir);
-            goto cleanup;
         }
 
         pb_release(RegisterDirectoryRequest_fields, &registerdir);
-        uint64_t ticks = mach_absolute_time();
-        int64_t timeNow = mach_absolute_time_to_ns(ticks) + startUpTime;
+        int64_t timeNow = platform_state_current_time(platform_state);
         char resp[32];
         snprintf(resp, sizeof(resp), "%lld", timeNow);
         http_respond_200(client_fd, resp);
@@ -1074,12 +768,12 @@ static void handle_http_post(int client_fd) {
         if (repoid >= 0) {
             char key[20];
             snprintf(key, sizeof(key), "3:%08d", repoid);
-            if (delete_value_from_leveldb(key) != 0) {
+            if (delete_value_from_leveldb(db, key) != 0) {
                 pb_release(RegisterDirectoryRequest_fields, &request);
                 http_respond_500(client_fd, "Failed to remove workspace");
                 goto close_cleanup;
             }
-            remove_repo_entries_from_leveldb(repoid);
+            remove_repo_entries_from_leveldb(db, repoid);
         }
 
         pb_release(RegisterDirectoryRequest_fields, &request);
@@ -1196,10 +890,10 @@ int64_t get_boot_time_nanoseconds(void) {
     return default_boot_ns;
 }
 void handle_signal(int sig) {
-    char buf[32];
-    uint64_t ticks = mach_absolute_time();
-    snprintf(buf, sizeof(buf), "%"PRId64,startUpTime+mach_absolute_time_to_ns(ticks));
-    put_value_to_leveldb("2",(const char *)buf,strlen(buf));
+    (void)sig;
+    platform_state_handle_shutdown(platform_state);
+    platform_state_destroy(platform_state);
+    platform_state = NULL;
     leveldb_close(db);
     exit(0);
 }
@@ -1251,8 +945,11 @@ int main(int argc, char *argv[]) {
         startUpTime = get_boot_time_nanoseconds();
     }
     
-    work_q = dispatch_queue_create(WORKER_QUEUE_LABEL, DISPATCH_QUEUE_SERIAL);
-    repo_map_register_work_queue(work_q);
+    platform_state = platform_state_create(db, &startUpTime);
+    if (!platform_state) {
+        fprintf(stderr, "Failed to initialize platform state\n");
+        return 1;
+    }
     // Retrieve the workspace stored in leveldb
     leveldb_readoptions_t *ro = leveldb_readoptions_create();
     leveldb_iterator_t *it = leveldb_create_iterator(db, ro);
@@ -1281,49 +978,24 @@ int main(int argc, char *argv[]) {
                 leveldb_iter_next(it);
                 continue;
             }
-            FSEventsStream *ctx = malloc(sizeof(FSEventsStream));
-            memset(ctx, 0, sizeof(FSEventsStream));
-            FSEventStreamContext *fs_ctx = malloc(sizeof(FSEventStreamContext));
-            memset(fs_ctx, 0, sizeof(FSEventStreamContext));
-            ctx->work_q = work_q;
-            ctx->fs_ctx = fs_ctx;
-            CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-            CFStringRef s = CFStringCreateWithCString(NULL, normalized_workspace, kCFStringEncodingUTF8);
-            CFArrayAppendValue(arr, s);
-            CFRelease(s);
-            fs_ctx->info = ctx;
-            FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer |
-            kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
-            FSEventStreamEventId last_event_id = get_last_event_id_for_repo(repoid);
-            FSEventStreamEventId since_when = last_event_id > 0 ? last_event_id : kFSEventStreamEventIdSinceNow;
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, since_when, 0.0000001, flags);
-            ctx->root = strdup(normalized_workspace);
-            CFRelease(arr);
-            FSEventStreamSetDispatchQueue(ctx->stream, work_q);
-            if (!FSEventStreamStart(ctx->stream)) {
-                fprintf(stderr, "Failed to start FSEvent stream\n");
-                // cleanup
-                FSEventStreamInvalidate(ctx->stream);
-                FSEventStreamRelease(ctx->stream);
-                free(ctx->root);
-                free(ctx);
+            uint64_t since_when = get_last_event_id_for_repo(db, repoid);
+            if (!platform_state_register_workspace(platform_state, normalized_workspace, repoid, since_when)) {
+                fprintf(stderr, "Failed to restore watcher for %s\n", normalized_workspace);
+                leveldb_iter_next(it);
                 continue;
             }
-            
+
             if (strcmp(workspace, normalized_workspace) != 0) {
                 char *key_copy = malloc(key_len + 1);
                 if (key_copy) {
                     memcpy(key_copy, key, key_len);
                     key_copy[key_len] = '\0';
-                    if (put_value_to_leveldb(key_copy, normalized_workspace, strlen(normalized_workspace)) != 0) {
+                    if (put_value_to_leveldb(db, key_copy, normalized_workspace, strlen(normalized_workspace)) != 0) {
                         fprintf(stderr, "Failed to normalize stored workspace path for repo %d\n", repoid);
                     }
                     free(key_copy);
                 }
             }
-
-            repo_map_add(normalized_workspace, repoid,ctx);
-            // creat stream
 
         }
         leveldb_iter_next(it);
@@ -1342,9 +1014,10 @@ int main(int argc, char *argv[]) {
 
     printf("Watching paths... Ctrl-C to exit\n");
 
-    // run CFRunLoop (blocks)
-    CFRunLoopRun();
+    platform_state_run_loop(platform_state);
 
+    platform_state_destroy(platform_state);
+    platform_state = NULL;
     // cleanup (not usually reached)
     return 0;
 }

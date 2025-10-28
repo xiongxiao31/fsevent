@@ -1,17 +1,9 @@
 #pragma once
 #include "uthash.h"
-#include <dispatch/dispatch.h>
-#include <CoreServices/CoreServices.h>
 #include <stdbool.h>
-typedef struct {
-    dispatch_queue_t work_q;
-    FSEventStreamRef stream;
-    char *root;
-    FSEventStreamEventId lastGood;
-    FSEventStreamEventId since;
-    dispatch_group_t group;
-    FSEventStreamContext *fs_ctx;
-} FSEventsStream;
+
+typedef struct dispatch_queue_s *dispatch_queue_t;
+typedef struct FSEventsStream FSEventsStream;
 typedef struct {
     char workspace[512];
     int repoid;
