@@ -72,10 +72,24 @@ static bool ensure_directory_exists(const char *path) {
 }
 
 static bool canonicalize_path(const char *input, char *output, size_t size) {
-    if (!input || !output || size == 0) return false;
-    char *resolved = realpath(input, output);
-    if (resolved) return true;
+    if (!input || !output || size == 0)
+        return false;
+
+#if defined(_WIN32)
+    if (_fullpath(output, input, size) != NULL) {
+        for (char *p = output; *p; ++p) {
+            if (*p == '\\') *p = '/';
+        }
+        return true;
+    }
     return false;
+
+#else
+    char *resolved = realpath(input, output);
+    if (resolved != NULL)
+        return true;
+    return false;
+#endif
 }
 
 static bool is_path_within_home(const char *path) {
@@ -518,38 +532,25 @@ static void remove_repo_entries_from_leveldb(int repoid) {
     }
 }
 
-static void process_path(Job *job) {
-    persist_job_event(job);
 
-    if (job) {
-        if (job->path) free(job->path);
-        if (job->root) free(job->root);
-        free(job);
-    }
-}
 
-static void process_dir(Job *job) {
+static void dispatch_worker_func(void *vjob) {
+    Job *job = (Job*)vjob;
     if (!job) return;
-
-    if (!(job->flag & kFSEventStreamEventFlagItemIsDir)) {
-        job->flag |= kFSEventStreamEventFlagItemIsDir;
-    }
-
     persist_job_event(job);
-
-    if (job->path) free(job->path);
-    if (job->root) free(job->root);
+    free(job->path);
+    free(job->root);
     free(job);
 }
 
-/* dispatch wrappers */
-static void dispatch_worker_func(void *vjob) {
-    Job *job = (Job*)vjob;
-    process_path(job);
-}
 static void dispatch_worker_func_dir(void *vjob) {
     Job *job = (Job*)vjob;
-    process_dir(job);
+    if (!job) return;
+    job->flag |= kFSEventStreamEventFlagItemIsDir;
+    persist_job_event(job);
+    free(job->path);
+    free(job->root);
+    free(job);
 }
 
 
@@ -601,14 +602,14 @@ static void fsevent_callback( ConstFSEventStreamRef streamRef, void *clientCallB
                 job->flag = flags;
                 job->eventid = eventIds[i];
                 job->root = strdup(root);
-                dispatch_async_f(work_q, job, dispatch_worker_func);
+                dispatch_worker_func(job);
             } else if (flags & kFSEventStreamEventFlagItemIsDir) {
                 Job *job = malloc(sizeof(Job));
                 job->path = strdup(p);
                 job->flag = flags;
                 job->eventid = eventIds[i];
                 job->root = strdup(root);
-                dispatch_async_f(work_q, job, dispatch_worker_func_dir);
+                dispatch_worker_func_dir(job);
             }
         }
     }
@@ -805,6 +806,14 @@ static void handle_http_get(int client_fd) {
             return;
         }
         char key[1024];
+        RepoMapEntry *entry = repo_map_get_entry(normalized_workspace);
+        FSEventStreamFlushSync(entry->stream->stream);
+        
+        dispatch_sync(work_q,^{
+            printf("asdasd\n");
+//            sleep(1);
+        });
+        
         if(lastsynctime && eventid){
             snprintf(key, sizeof(key),"1:%08d:%020lld:%020llu", repoid, lastsynctime, eventid);
         }else if(lastsynctime && !eventid){
@@ -949,7 +958,7 @@ static void handle_http_post(int client_fd) {
                 kFSEventStreamCreateFlagWatchRoot;
 
             ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr,
-                                              kFSEventStreamEventIdSinceNow, 0.000000001, flags);
+                                              kFSEventStreamEventIdSinceNow, 0.5, flags);
             CFRelease(arr);
             arr = NULL;
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);
@@ -1296,7 +1305,7 @@ int main(int argc, char *argv[]) {
             kFSEventStreamCreateFlagIgnoreSelf | kFSEventStreamCreateFlagWatchRoot;
             FSEventStreamEventId last_event_id = get_last_event_id_for_repo(repoid);
             FSEventStreamEventId since_when = last_event_id > 0 ? last_event_id : kFSEventStreamEventIdSinceNow;
-            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, since_when, 0.0000001, flags);
+            ctx->stream = FSEventStreamCreate(NULL, &fsevent_callback, fs_ctx, arr, since_when, 0.5, flags);
             ctx->root = strdup(normalized_workspace);
             CFRelease(arr);
             FSEventStreamSetDispatchQueue(ctx->stream, work_q);

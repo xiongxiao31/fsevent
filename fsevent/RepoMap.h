@@ -7,8 +7,6 @@ typedef struct {
     dispatch_queue_t work_q;
     FSEventStreamRef stream;
     char *root;
-    FSEventStreamEventId lastGood;
-    FSEventStreamEventId since;
     dispatch_group_t group;
     FSEventStreamContext *fs_ctx;
 } FSEventsStream;
@@ -37,3 +35,5 @@ void repo_map_set_stream(const char *workspace, FSEventsStream *stream);
 
 // 记录工作队列，用于安全同步清理
 void repo_map_register_work_queue(dispatch_queue_t queue);
+
+RepoMapEntry *repo_map_get_entry(const char *workspace);

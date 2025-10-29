@@ -102,7 +102,13 @@ bool repo_map_get_repoid(const char *workspace, int *repoid_out) {
     pthread_mutex_unlock(&gRepoMapLock);
     return found;
 }
-
+RepoMapEntry *repo_map_get_entry(const char *workspace){
+    RepoMapEntry *entry = NULL;
+    pthread_mutex_lock(&gRepoMapLock);
+    HASH_FIND_STR(g_repo_map, workspace, entry);
+    pthread_mutex_unlock(&gRepoMapLock);
+    return entry;
+}
 // 删除指定 workspace 的 entry
 bool repo_map_remove(const char *workspace, int *repoid_out) {
     pthread_mutex_lock(&gRepoMapLock);
