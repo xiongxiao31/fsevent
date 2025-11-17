@@ -40,7 +40,7 @@
          BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
          <BreakpointContent
             uuid = "8500A516-D7B5-409F-A49A-5D1EDFE858FC"
-            shouldBeEnabled = "Yes"
+            shouldBeEnabled = "No"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
             filePath = "fsevent/RepoMap.c"
@@ -49,6 +49,22 @@
             startingLineNumber = "137"
             endingLineNumber = "137"
             landmarkName = "repo_map_remove(workspace, repoid_out)"
+            landmarkType = "9">
+         </BreakpointContent>
+      </BreakpointProxy>
+      <BreakpointProxy
+         BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
+         <BreakpointContent
+            uuid = "7B46583A-4E61-4817-BD0E-28C752F2ABC0"
+            shouldBeEnabled = "No"
+            ignoreCount = "0"
+            continueAfterRunningActions = "No"
+            filePath = "fsevent/main.c"
+            startingColumnNumber = "9223372036854775807"
+            endingColumnNumber = "9223372036854775807"
+            startingLineNumber = "1207"
+            endingLineNumber = "1207"
+            landmarkName = "handle_signal(sig)"
             landmarkType = "9">
          </BreakpointContent>
       </BreakpointProxy>
